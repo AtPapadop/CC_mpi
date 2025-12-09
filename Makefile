@@ -3,6 +3,12 @@ CFLAGS = -O3 -fopenmp -Iinclude -Wall -Wextra -Wpedantic
 LDFLAGS = -fopenmp
 LDLIBS = -lmatio
 
+# If MATIO_ROOT is set (e.g. by module load matio), use it
+ifdef MATIO_ROOT
+    CFLAGS += -I$(MATIO_ROOT)/include
+    LDFLAGS += -L$(MATIO_ROOT)/lib
+endif
+
 SRC_DIR = src
 OBJ_DIR = build
 BIN_DIR = bin
