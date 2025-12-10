@@ -1,7 +1,6 @@
 #define _POSIX_C_SOURCE 200112L
 
 #include "cc_mpi.h"
-
 #include <mpi.h>
 #include <omp.h>
 
@@ -20,6 +19,7 @@
 #endif
 
 #define LABEL_TAG 1234
+#define ALIGN_BYTES 64
 
 /* Simple dynamic array for int32_t */
 typedef struct
@@ -91,6 +91,48 @@ static inline int owner_of_vertex(int32_t v,
     }
 }
 
+/* 64-byte aligned malloc with MPI_Abort on error (for hot arrays). */
+static void *xaligned_alloc_or_die(size_t nbytes)
+{
+    void *ptr = NULL;
+    if (nbytes == 0)
+        return NULL;
+
+    int rc = posix_memalign(&ptr, ALIGN_BYTES, nbytes);
+    if (rc != 0 || !ptr)
+    {
+        fprintf(stderr, "xaligned_alloc_or_die: posix_memalign failed for %zu bytes (rc=%d)\n",
+                nbytes, rc);
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    }
+    return ptr;
+}
+
+/* Get current label (component representative) for global vertex v. */
+static inline int32_t get_label_global(int32_t v,
+                                       const int32_t *restrict local_labels,
+                                       const int32_t *restrict ghost_labels,
+                                       const int32_t *restrict ghost_index,
+                                       int32_t v_start,
+                                       int32_t v_end)
+{
+    if (v >= v_start && v < v_end)
+    {
+        return local_labels[v - v_start];
+    }
+    else
+    {
+        int32_t gi = ghost_index[v];
+        if (gi >= 0)
+            return ghost_labels[gi];
+    }
+    return v; /* fallback: treat as its own representative */
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Connected components: distributed hooking + shortcutting (union-find-ish) */
+/* -------------------------------------------------------------------------- */
+
 void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                                                int32_t *restrict labels_global,
                                                int chunk_size,
@@ -111,24 +153,19 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     if (n_global == 0)
         return;
 
-    /* Effective exchange interval */
+    /* Effective exchange interval (how many local sweeps before halo exchange) */
     int eff_exchange = (exchange_interval > 0) ? exchange_interval : 1;
 
-    /* Local label arrays (double-buffered) */
+    /* Local label arrays (double-buffered), 64-byte aligned. */
     int32_t *local_labels = NULL;
     int32_t *local_labels_new = NULL;
 
     if (n_local > 0)
     {
-        local_labels = (int32_t *)malloc((size_t)n_local * sizeof(int32_t));
-        local_labels_new = (int32_t *)malloc((size_t)n_local * sizeof(int32_t));
-        if (!local_labels || !local_labels_new)
-        {
-            fprintf(stderr, "[rank %d] Failed to allocate local label arrays\n", comm_rank);
-            MPI_Abort(comm, EXIT_FAILURE);
-        }
+        local_labels = (int32_t *)xaligned_alloc_or_die((size_t)n_local * sizeof(int32_t));
+        local_labels_new = (int32_t *)xaligned_alloc_or_die((size_t)n_local * sizeof(int32_t));
 
-/* Initialize labels to vertex IDs (global) */
+        /* Initialize labels to vertex IDs (global) */
 #pragma omp parallel for schedule(static)
         for (int32_t i = 0; i < n_local; ++i)
         {
@@ -139,14 +176,9 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     }
 
     /* Ghost mapping: map global vertex -> ghost index (0..ghost_count-1).
-     * We use an array of size n_global for simplicity.
+     * We use an array of size n_global for O(1) lookup.
      */
-    int32_t *ghost_index = (int32_t *)malloc((size_t)n_global * sizeof(int32_t));
-    if (!ghost_index)
-    {
-        fprintf(stderr, "[rank %d] Failed to allocate ghost_index\n", comm_rank);
-        MPI_Abort(comm, EXIT_FAILURE);
-    }
+    int32_t *ghost_index = (int32_t *)xaligned_alloc_or_die((size_t)n_global * sizeof(int32_t));
     for (int32_t i = 0; i < n_global; ++i)
     {
         ghost_index[i] = -1;
@@ -219,13 +251,8 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     int32_t *ghost_labels_prev = NULL;
     if (ghost_count > 0)
     {
-        ghost_labels = (int32_t *)malloc((size_t)ghost_count * sizeof(int32_t));
-        ghost_labels_prev = (int32_t *)malloc((size_t)ghost_count * sizeof(int32_t));
-        if (!ghost_labels || !ghost_labels_prev)
-        {
-            fprintf(stderr, "[rank %d] Failed to allocate ghost label arrays\n", comm_rank);
-            MPI_Abort(comm, EXIT_FAILURE);
-        }
+        ghost_labels = (int32_t *)xaligned_alloc_or_die((size_t)ghost_count * sizeof(int32_t));
+        ghost_labels_prev = (int32_t *)xaligned_alloc_or_die((size_t)ghost_count * sizeof(int32_t));
 
         /* Initialize ghosts to their own vertex IDs. */
         for (int p = 0; p < comm_size; ++p)
@@ -236,12 +263,12 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                 int32_t v = vec->data[i];
                 int32_t idx = ghost_index[v];
                 ghost_labels[idx] = v;
+                ghost_labels_prev[idx] = v;
             }
         }
     }
 
     /* Handshake: compute who we must send labels to (send_to). */
-
     int *need_from_counts = (int *)malloc((size_t)comm_size * sizeof(int));
     int *send_to_counts = (int *)malloc((size_t)comm_size * sizeof(int));
     if (!need_from_counts || !send_to_counts)
@@ -364,21 +391,11 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     {
         if (need_from_counts[p] > 0)
         {
-            recv_label_bufs[p] = (int32_t *)malloc((size_t)need_from_counts[p] * sizeof(int32_t));
-            if (!recv_label_bufs[p])
-            {
-                fprintf(stderr, "[rank %d] Failed to allocate recv_label_bufs[%d]\n", comm_rank, p);
-                MPI_Abort(comm, EXIT_FAILURE);
-            }
+            recv_label_bufs[p] = (int32_t *)xaligned_alloc_or_die((size_t)need_from_counts[p] * sizeof(int32_t));
         }
         if (send_to_counts[p] > 0)
         {
-            send_label_bufs[p] = (int32_t *)malloc((size_t)send_to_counts[p] * sizeof(int32_t));
-            if (!send_label_bufs[p])
-            {
-                fprintf(stderr, "[rank %d] Failed to allocate send_label_bufs[%d]\n", comm_rank, p);
-                MPI_Abort(comm, EXIT_FAILURE);
-            }
+            send_label_bufs[p] = (int32_t *)xaligned_alloc_or_die((size_t)send_to_counts[p] * sizeof(int32_t));
         }
     }
 
@@ -427,6 +444,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                     int64_t row_begin = row_ptr[li];
                     int64_t row_end = row_ptr[li + 1];
 
+                    /* Hooking: take minimum label over self and neighbors. */
                     for (int64_t j = row_begin; j < row_end; ++j)
                     {
                         int32_t v = col_idx[j];
@@ -445,15 +463,28 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                             if (gidx >= 0)
                                 neighbor_label = ghost_labels[gidx];
                             else
-                                neighbor_label = v; /* fallback, shouldn't happen */
+                                neighbor_label = v; /* safety fallback */
                         }
 
                         if (neighbor_label < new_label)
                             new_label = neighbor_label;
                     }
 
+                    /* Shortcutting (one step of pointer jumping):
+                     * new_label := label[new_label].
+                     * This quickly collapses chains like 5->4->2 into 2.
+                     */
+                    if (new_label != old_label)
+                    {
+                        int32_t root = get_label_global(new_label,
+                                                        local_labels, ghost_labels, ghost_index,
+                                                        v_start, v_end);
+                        if (root < new_label)
+                            new_label = root;
+                    }
+
                     local_labels_new[li] = new_label;
-                    if (new_label < old_label)
+                    if (new_label != old_label)
                         local_changed = true;
                 }
 
@@ -573,14 +604,13 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     if (comm_rank == 0)
     {
-        fprintf(stderr, "CC MPI+OMP (halo, interval=%d) converged in %d iterations\n",
+        fprintf(stderr, "CC MPI+OMP (fast, halo, interval=%d) converged in %d iterations\n",
                 eff_exchange, iterations);
     }
 
     /* ---- Gather global membership vector on all ranks ---- */
-    int32_t base, rem;
-    base = n_global / comm_size;
-    rem = n_global % comm_size;
+    int32_t base = n_global / comm_size;
+    int32_t rem = n_global % comm_size;
 
     int *all_counts = (int *)malloc((size_t)comm_size * sizeof(int));
     int *all_displs = (int *)malloc((size_t)comm_size * sizeof(int));
@@ -649,6 +679,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     vec_free(&neighbor_ranks);
 }
 
+/* Same as your original helper; kept for completeness. */
 uint32_t count_connected_components(const int32_t *restrict labels_global, int32_t n_global)
 {
     if (n_global <= 0 || labels_global == NULL)
