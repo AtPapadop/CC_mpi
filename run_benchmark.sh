@@ -5,7 +5,7 @@
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1         # 1 MPI rank per node
 #SBATCH --cpus-per-task=128         # 128 cores for OpenMP
-#SBATCH --time=01:00:00
+#SBATCH --time=00:30:00
 #SBATCH --partition=rome
 
 module load gcc/13.2.0-iqpfkya  openmpi/5.0.3-rhzbeym matio
@@ -18,7 +18,6 @@ export OMP_PLACES=cores
 export OMP_PROC_BIND=spread
 
 cd ~/CC_mpi/
-make
 
 mpirun -np $SLURM_NTASKS \
     bin/mpi_cc_benchmark \

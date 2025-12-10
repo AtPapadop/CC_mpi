@@ -5,7 +5,7 @@
 #SBATCH --nodes=5
 #SBATCH --ntasks-per-node=1      # 1 MPI process per node
 #SBATCH --cpus-per-task=20       # 20 OpenMP threads per process
-#SBATCH --time=01:00:00
+#SBATCH --time=00:30:00
 #SBATCH --partition=batch
 
 module load gcc/13.2.0-iqpfkya  openmpi/5.0.3-rhzbeym matio
