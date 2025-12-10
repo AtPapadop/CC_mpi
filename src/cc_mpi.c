@@ -87,7 +87,7 @@ static inline int owner_of_vertex(uint32_t v,
 
     uint32_t comm_size_u = (uint32_t)comm_size;
     uint32_t base = (comm_size_u > 0) ? (n_global / comm_size_u) : 0;
-    uint32_t rem  = (comm_size_u > 0) ? (n_global % comm_size_u) : 0;
+    uint32_t rem = (comm_size_u > 0) ? (n_global % comm_size_u) : 0;
     uint64_t threshold = (uint64_t)(base + 1u) * rem;
 
     if ((uint64_t)v < threshold)
@@ -157,9 +157,9 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     const uint32_t n_global = Gd->n_global;
     const uint64_t *row_ptr = Gd->row_ptr; /* local row_ptr (size n_local+1) */
     const uint32_t *col_idx = Gd->col_idx; /* local col_idx (size m_local) */
-    const uint32_t v_start  = Gd->v_start;
-    const uint32_t v_end    = Gd->v_end;
-    const uint32_t n_local  = Gd->n_local;
+    const uint32_t v_start = Gd->v_start;
+    const uint32_t v_end = Gd->v_end;
+    const uint32_t n_local = Gd->n_local;
 
     if (n_global == 0)
         return;
@@ -168,12 +168,12 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     int eff_exchange = (exchange_interval > 0) ? exchange_interval : 1;
 
     /* Local label arrays (double-buffered), 64-byte aligned. */
-    uint32_t *local_labels     = NULL;
+    uint32_t *local_labels = NULL;
     uint32_t *local_labels_new = NULL;
 
     if (n_local > 0)
     {
-        local_labels     = (uint32_t *)xaligned_alloc_or_die((size_t)n_local * sizeof(uint32_t));
+        local_labels = (uint32_t *)xaligned_alloc_or_die((size_t)n_local * sizeof(uint32_t));
         local_labels_new = (uint32_t *)xaligned_alloc_or_die((size_t)n_local * sizeof(uint32_t));
 
         /* Initialize labels to vertex IDs (global) */
@@ -181,7 +181,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
         for (uint32_t i = 0; i < n_local; ++i)
         {
             uint32_t v = v_start + i;
-            local_labels[i]     = v;
+            local_labels[i] = v;
             local_labels_new[i] = v;
         }
     }
@@ -206,18 +206,13 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
         vec_init(&need_from[p]);
 
     /* Mark array to avoid duplicates when collecting ghosts. */
-    unsigned char *mark = (unsigned char *)calloc((size_t)n_global, sizeof(unsigned char));
-    if (!mark)
-    {
-        fprintf(stderr, "[rank %d] Failed to allocate mark array\n", comm_rank);
-        MPI_Abort(comm, EXIT_FAILURE);
-    }
+    uint32_t ghost_count = 0;
 
-    /* Discover ghost vertices from local adjacency. */
+    /* Discover ghost vertices from local adjacency; build need_from and ghost_index. */
     for (uint32_t li = 0; li < n_local; ++li)
     {
         uint64_t row_begin = row_ptr[li];
-        uint64_t row_end   = row_ptr[li + 1];
+        uint64_t row_end = row_ptr[li + 1];
 
         for (uint64_t j = row_begin; j < row_end; ++j)
         {
@@ -235,34 +230,20 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
             if (owner == comm_rank)
                 continue;
 
-            if (!mark[v])
+            if (ghost_index[v] == UINT32_MAX)
             {
-                mark[v] = 1;
+                /* First time we see this remote vertex: add to need_from and assign ghost index. */
                 vec_push(&need_from[owner], v);
+                ghost_index[v] = ghost_count++;
             }
         }
     }
 
-    free(mark);
-    mark = NULL;
-
-    /* Assign ghost indices and allocate ghost label array. */
-    uint32_t ghost_count = 0;
-    for (int p = 0; p < comm_size; ++p)
-    {
-        Int32Vec *vec = &need_from[p];
-        for (int i = 0; i < vec->size; ++i)
-        {
-            uint32_t v = vec->data[i];
-            ghost_index[v] = ghost_count++;
-        }
-    }
-
-    uint32_t *ghost_labels      = NULL;
+    uint32_t *ghost_labels = NULL;
     uint32_t *ghost_labels_prev = NULL;
     if (ghost_count > 0)
     {
-        ghost_labels      = (uint32_t *)xaligned_alloc_or_die((size_t)ghost_count * sizeof(uint32_t));
+        ghost_labels = (uint32_t *)xaligned_alloc_or_die((size_t)ghost_count * sizeof(uint32_t));
         ghost_labels_prev = (uint32_t *)xaligned_alloc_or_die((size_t)ghost_count * sizeof(uint32_t));
 
         /* Initialize ghosts to their own vertex IDs. */
@@ -275,7 +256,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                 uint32_t idx = ghost_index[v];
                 if (idx != UINT32_MAX)
                 {
-                    ghost_labels[idx]      = v;
+                    ghost_labels[idx] = v;
                     ghost_labels_prev[idx] = v;
                 }
             }
@@ -284,7 +265,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     /* Handshake: compute who we must send labels to (send_to). */
     int *need_from_counts = (int *)malloc((size_t)comm_size * sizeof(int));
-    int *send_to_counts   = (int *)malloc((size_t)comm_size * sizeof(int));
+    int *send_to_counts = (int *)malloc((size_t)comm_size * sizeof(int));
     if (!need_from_counts || !send_to_counts)
     {
         fprintf(stderr, "[rank %d] Failed to allocate counts arrays\n", comm_rank);
@@ -298,12 +279,12 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     /* send_to_counts[p] = how many vertices rank p needs from us */
     MPI_Alltoall(need_from_counts, 1, MPI_INT,
-                 send_to_counts,   1, MPI_INT,
+                 send_to_counts, 1, MPI_INT,
                  comm);
 
     /* Flatten the need_from arrays for all-to-all. */
     int *need_from_displs = (int *)malloc((size_t)comm_size * sizeof(int));
-    int *send_to_displs   = (int *)malloc((size_t)comm_size * sizeof(int));
+    int *send_to_displs = (int *)malloc((size_t)comm_size * sizeof(int));
     if (!need_from_displs || !send_to_displs)
     {
         fprintf(stderr, "[rank %d] Failed to allocate displs arrays\n", comm_rank);
@@ -325,7 +306,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     }
 
     uint32_t *need_from_flat = NULL;
-    uint32_t *send_to_flat   = NULL;
+    uint32_t *send_to_flat = NULL;
     if (total_need_from > 0)
     {
         need_from_flat = (uint32_t *)malloc((size_t)total_need_from * sizeof(uint32_t));
@@ -358,7 +339,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     /* All-to-all exchange of vertex IDs we must send labels for. */
     MPI_Alltoallv(need_from_flat, need_from_counts, need_from_displs, MPI_UINT32_T,
-                  send_to_flat,  send_to_counts,   send_to_displs,   MPI_UINT32_T,
+                  send_to_flat, send_to_counts, send_to_displs, MPI_UINT32_T,
                   comm);
 
     /* Build send_to views that reference send_to_flat. */
@@ -375,8 +356,8 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
         int cnt = send_to_counts[p];
         if (cnt > 0)
         {
-            send_to[p].data     = send_to_flat + send_to_displs[p];
-            send_to[p].size     = cnt;
+            send_to[p].data = send_to_flat + send_to_displs[p];
+            send_to[p].size = cnt;
             send_to[p].capacity = cnt; /* view; do not free individually */
         }
     }
@@ -384,18 +365,20 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     /* ===================== NEW: MPI distributed-graph communicator ==================== */
 
     /* Build list of incoming and outgoing neighbors for dist graph. */
-    int indegree  = 0;
+    int indegree = 0;
     int outdegree = 0;
     for (int p = 0; p < comm_size; ++p)
     {
-        if (need_from_counts[p] > 0) ++indegree;
-        if (send_to_counts[p]   > 0) ++outdegree;
+        if (need_from_counts[p] > 0)
+            ++indegree;
+        if (send_to_counts[p] > 0)
+            ++outdegree;
     }
 
-    int *sources      = (indegree  > 0) ? (int *)malloc((size_t)indegree  * sizeof(int)) : NULL;
+    int *sources = (indegree > 0) ? (int *)malloc((size_t)indegree * sizeof(int)) : NULL;
     int *destinations = (outdegree > 0) ? (int *)malloc((size_t)outdegree * sizeof(int)) : NULL;
 
-    if ((indegree  > 0 && !sources) ||
+    if ((indegree > 0 && !sources) ||
         (outdegree > 0 && !destinations))
     {
         fprintf(stderr, "[rank %d] Failed to allocate sources/destinations\n", comm_rank);
@@ -406,25 +389,27 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     int idx_out = 0;
     for (int p = 0; p < comm_size; ++p)
     {
-        if (need_from_counts[p] > 0) sources[idx_in++]   = p;
-        if (send_to_counts[p]   > 0) destinations[idx_out++] = p;
+        if (need_from_counts[p] > 0)
+            sources[idx_in++] = p;
+        if (send_to_counts[p] > 0)
+            destinations[idx_out++] = p;
     }
 
     MPI_Comm comm_graph = MPI_COMM_NULL;
     MPI_Dist_graph_create_adjacent(
         comm,
-        indegree,  sources,      MPI_UNWEIGHTED,
+        indegree, sources, MPI_UNWEIGHTED,
         outdegree, destinations, MPI_UNWEIGHTED,
         MPI_INFO_NULL, 0, &comm_graph);
 
     /* Neigh all-to-allv send/recv layout (indices are neighbor indices, not ranks). */
     int *sendcounts = (outdegree > 0) ? (int *)malloc((size_t)outdegree * sizeof(int)) : NULL;
-    int *sdispls    = (outdegree > 0) ? (int *)malloc((size_t)outdegree * sizeof(int)) : NULL;
-    int *recvcounts = (indegree  > 0) ? (int *)malloc((size_t)indegree  * sizeof(int)) : NULL;
-    int *rdispls    = (indegree  > 0) ? (int *)malloc((size_t)indegree  * sizeof(int)) : NULL;
+    int *sdispls = (outdegree > 0) ? (int *)malloc((size_t)outdegree * sizeof(int)) : NULL;
+    int *recvcounts = (indegree > 0) ? (int *)malloc((size_t)indegree * sizeof(int)) : NULL;
+    int *rdispls = (indegree > 0) ? (int *)malloc((size_t)indegree * sizeof(int)) : NULL;
 
     if ((outdegree > 0 && (!sendcounts || !sdispls)) ||
-        (indegree  > 0 && (!recvcounts || !rdispls)))
+        (indegree > 0 && (!recvcounts || !rdispls)))
     {
         fprintf(stderr, "[rank %d] Failed to allocate neighbor counts/displs\n", comm_rank);
         MPI_Abort(comm, EXIT_FAILURE);
@@ -436,7 +421,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
         {
             int p = destinations[k];
             sendcounts[k] = send_to_counts[p];
-            sdispls[k]    = send_to_displs[p];
+            sdispls[k] = send_to_displs[p];
         }
     }
     if (indegree > 0)
@@ -445,30 +430,30 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
         {
             int p = sources[k];
             recvcounts[k] = need_from_counts[p];
-            rdispls[k]    = need_from_displs[p];
+            rdispls[k] = need_from_displs[p];
         }
     }
 
     /* Flat label buffers that match send_to_flat/need_from_flat layout. */
-    uint32_t *send_labels_flat = (total_send_to   > 0)
-                                 ? (uint32_t *)xaligned_alloc_or_die((size_t)total_send_to   * sizeof(uint32_t))
-                                 : NULL;
+    uint32_t *send_labels_flat = (total_send_to > 0)
+                                     ? (uint32_t *)xaligned_alloc_or_die((size_t)total_send_to * sizeof(uint32_t))
+                                     : NULL;
     uint32_t *recv_labels_flat = (total_need_from > 0)
-                                 ? (uint32_t *)xaligned_alloc_or_die((size_t)total_need_from * sizeof(uint32_t))
-                                 : NULL;
+                                     ? (uint32_t *)xaligned_alloc_or_die((size_t)total_need_from * sizeof(uint32_t))
+                                     : NULL;
 
     /* ===================== END NEW COMM SETUP ======================================== */
 
     /* OpenMP scheduling */
     const int DEFAULT_CHUNK_SIZE = 4096;
-    const int chunking_enabled   = (chunk_size != 1);
-    const int effective_chunk    = (chunk_size > 0) ? chunk_size : DEFAULT_CHUNK_SIZE;
+    const int chunking_enabled = (chunk_size != 1);
+    const int effective_chunk = (chunk_size > 0) ? chunk_size : DEFAULT_CHUNK_SIZE;
 
     omp_set_schedule(chunking_enabled ? omp_sched_dynamic : omp_sched_static,
                      chunking_enabled ? effective_chunk : 0);
 
     bool global_changed = true;
-    int  iterations     = 0;
+    int iterations = 0;
 
     while (global_changed)
     {
@@ -488,7 +473,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                     uint32_t new_label = old_label;
 
                     uint64_t row_begin = row_ptr[li];
-                    uint64_t row_end   = row_ptr[li + 1];
+                    uint64_t row_end = row_ptr[li + 1];
 
                     /* Hooking: take minimum label over self and neighbors. */
                     for (uint64_t j = row_begin; j < row_end; ++j)
@@ -638,7 +623,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     /* ---- Gather global membership vector on all ranks ---- */
     uint32_t base = (comm_size > 0) ? (n_global / (uint32_t)comm_size) : 0;
-    uint32_t rem  = (comm_size > 0) ? (n_global % (uint32_t)comm_size) : 0;
+    uint32_t rem = (comm_size > 0) ? (n_global % (uint32_t)comm_size) : 0;
 
     int *all_counts = (int *)malloc((size_t)comm_size * sizeof(int));
     int *all_displs = (int *)malloc((size_t)comm_size * sizeof(int));
