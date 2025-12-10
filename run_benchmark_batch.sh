@@ -8,7 +8,7 @@
 #SBATCH --time=01:00:00
 #SBATCH --partition=batch
 
-gcc/13.2.0-iqpfkya  openmpi/5.0.3-rhzbeym matio
+module load gcc/13.2.0-iqpfkya  openmpi/5.0.3-rhzbeym matio
 
 export GRAPH_NAME="com-Friendster"
 

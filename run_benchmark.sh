@@ -8,7 +8,7 @@
 #SBATCH --time=01:00:00
 #SBATCH --partition=rome
 
-gcc/13.2.0-iqpfkya  openmpi/5.0.3-rhzbeym matio
+module load gcc/13.2.0-iqpfkya  openmpi/5.0.3-rhzbeym matio
 
 export GRAPH_NAME="com-Friendster"
 
@@ -18,6 +18,7 @@ export OMP_PLACES=cores
 export OMP_PROC_BIND=spread
 
 cd ~/CC_mpi/
+make
 
 mpirun -np $SLURM_NTASKS \
     bin/mpi_cc_benchmark \
