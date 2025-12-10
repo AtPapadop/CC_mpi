@@ -18,10 +18,4 @@ export OMP_PROC_BIND=spread
 
 cd ~/CC_mpi/
 
-mpirun -np $SLURM_NTASKS \
-    bin/mpi_cc_benchmark \
-    -r 5 \
-    -c 1024,2048,4096,8192 \
-    -e 1,2,4,8 \
-    -o results/${GRAPH_NAME}_batch/
-    data/${GRAPH_NAME}.mat
+mpirun -np $SLURM_NTASKS ./bin/mpi_cc_benchmark -r 5 -c 1024,2048,4096,8192 -e 1,2,4,8 -o results/${GRAPH_NAME}/ data/${GRAPH_NAME}.mat
