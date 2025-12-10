@@ -14,14 +14,14 @@
  */
 typedef struct
 {
-  int32_t n_global; // total number of vertices in the global graph
-  int64_t m_global; // total number of edges in the global graph
-  int32_t n_local;  // number of vertices owned by this rank
-  int32_t m_local;  // number of edges owned by this rank
-  int32_t v_start;  // global vertex ID of the first vertex owned by this rank
-  int32_t v_end;    // global vertex ID of the last vertex owned by this rank (exclusive)
-  int64_t *row_ptr; // local row pointers (size n_local + 1)
-  int32_t *col_idx; // column indices (global vertex IDs)
+  uint32_t n_global; // total number of vertices in the global graph
+  uint64_t m_global; // total number of edges in the global graph
+  uint32_t n_local;  // number of vertices owned by this rank
+  uint64_t m_local;  // number of edges owned by this rank
+  uint32_t v_start;  // global vertex ID of the first vertex owned by this rank
+  uint32_t v_end;    // global vertex ID of the last vertex owned by this rank (exclusive)
+  uint64_t *row_ptr; // local row pointers (size n_local + 1)
+  uint32_t *col_idx; // column indices (global vertex IDs)
 } DistCSRGraph;
 
 /**

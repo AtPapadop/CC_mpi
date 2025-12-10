@@ -205,11 +205,11 @@ int main(int argc, char **argv)
     }
 
     if (rank == 0)
-        printf("Graph loaded (n=%d, m=%" PRId64 ") in %.6f seconds.\n",
+        printf("Graph loaded (n=%" PRIu32 ", m=%" PRIu64 ") in %.6f seconds.\n",
                Gd.n_global, Gd.m_global, t_load_end - t_load_start);
 
     // Labels buffer for all ranks
-    int32_t *labels_global = malloc((size_t)Gd.n_global * sizeof(int32_t));
+    uint32_t *labels_global = malloc((size_t)Gd.n_global * sizeof(uint32_t));
     if (!labels_global)
     {
         fprintf(stderr, "[rank %d] Failed to allocate labels_global.\n", rank);

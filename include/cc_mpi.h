@@ -22,14 +22,14 @@
  * for vertex v, identical on all ranks.
  */
 void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
-                                               int32_t *restrict labels_global,
+                                               uint32_t *restrict labels_global,
                                                int chunk_size,
                                                int exchange_interval,
                                                MPI_Comm comm);
 /** 
  * Count the number of connected components from the global labels array.
 */
-uint32_t count_connected_components(const int32_t *restrict labels_global, int32_t n_global);
+uint32_t count_connected_components(const uint32_t *restrict labels_global, uint32_t n_global);
                                       
 
 #endif /* CC_MPI_H */

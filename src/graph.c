@@ -15,7 +15,7 @@
 // simple (u,v) edge
 typedef struct
 {
-  int32_t u, v;
+  uint32_t u, v;
 } Edge;
 
 // comparison function between edges for qsort
@@ -31,10 +31,10 @@ static int cmp_edge(const void *a, const void *b)
 }
 
 // deduplicate sorted edges in-place, updating m
-static void dedup_edges(Edge *E, int64_t *m, int drop_self_loops)
+static void dedup_edges(Edge *E, uint64_t *m, int drop_self_loops)
 {
-  int64_t write = 0;
-  for (int64_t r = 0; r < *m; ++r)
+  uint64_t write = 0;
+  for (uint64_t r = 0; r < *m; ++r)
   {
     if (drop_self_loops && E[r].u == E[r].v)
       continue;
@@ -102,12 +102,12 @@ int load_csr_from_mtx(const char *path, int symmetrize, int drop_self_loops, CSR
     return 4;
   }
 
-  int32_t n = (int32_t)((M > N) ? M : N);
+  uint32_t n = (uint32_t)((M > N) ? M : N);
   int symmetric_in_file =
       mm_is_symmetric(matcode) || mm_is_hermitian(matcode) || mm_is_skew(matcode);
 
   // allocate edges (worst case doubling)
-  int64_t cap = (int64_t)nz * (symmetric_in_file || symmetrize ? 2 : 1);
+  uint64_t cap = (uint64_t)nz * (uint64_t)(symmetric_in_file || symmetrize ? 2 : 1);
   Edge *E = (Edge *)malloc(sizeof(Edge) * cap);
   if (!E)
   {
@@ -115,7 +115,7 @@ int load_csr_from_mtx(const char *path, int symmetrize, int drop_self_loops, CSR
     return 5;
   }
 
-  int64_t m = 0;
+  uint64_t m = 0;
   for (int k = 0; k < nz; ++k)
   {
     int i, j;
@@ -132,38 +132,38 @@ int load_csr_from_mtx(const char *path, int symmetrize, int drop_self_loops, CSR
     }
     i--;
     j--; // convert to 0-based
-    if (i < 0 || j < 0 || i >= n || j >= n)
+    if (i < 0 || j < 0 || (uint32_t)i >= n || (uint32_t)j >= n)
       continue;
-    E[m++] = (Edge){i, j};
+    E[m++] = (Edge){(uint32_t)i, (uint32_t)j};
     if ((symmetric_in_file || symmetrize) && i != j)
-      E[m++] = (Edge){j, i};
+      E[m++] = (Edge){(uint32_t)j, (uint32_t)i};
   }
   fclose(f);
 
-  qsort(E, m, sizeof(Edge), cmp_edge);
+  qsort(E, (size_t)m, sizeof(Edge), cmp_edge);
   dedup_edges(E, &m, drop_self_loops);
 
-  int64_t *restrict row_ptr;
-  if (posix_memalign((void **)&row_ptr, 64, sizeof(int64_t) * (n + 1)) != 0)
+  uint64_t *restrict row_ptr;
+  if (posix_memalign((void **)&row_ptr, 64, sizeof(uint64_t) * (size_t)(n + 1)) != 0)
   {
     free(E);
     return 6;
   }
 
-  for (int64_t r = 0; r < m; ++r)
+  for (uint64_t r = 0; r < m; ++r)
     row_ptr[E[r].u + 1]++;
-  for (int32_t i = 0; i < n; ++i)
+  for (uint32_t i = 0; i < n; ++i)
     row_ptr[i + 1] += row_ptr[i];
 
-  int32_t *restrict col_idx;
-  if (posix_memalign((void **)&col_idx, 64, sizeof(int32_t) * m) != 0)
+  uint32_t *restrict col_idx;
+  if (posix_memalign((void **)&col_idx, 64, sizeof(uint32_t) * (size_t)m) != 0)
   {
     free(row_ptr);
     free(E);
     return 7;
   }
 
-  int64_t *head = (int64_t *)malloc(sizeof(int64_t) * n);
+  uint64_t *head = (uint64_t *)malloc(sizeof(uint64_t) * n);
   if (!head)
   {
     free(col_idx);
@@ -171,11 +171,11 @@ int load_csr_from_mtx(const char *path, int symmetrize, int drop_self_loops, CSR
     free(E);
     return 8;
   }
-  memcpy(head, row_ptr, sizeof(int64_t) * n);
+  memcpy(head, row_ptr, sizeof(uint64_t) * n);
 
-  for (int64_t r = 0; r < m; ++r)
+  for (uint64_t r = 0; r < m; ++r)
   {
-    int32_t u = E[r].u;
+    uint32_t u = E[r].u;
     col_idx[head[u]++] = E[r].v;
   }
 
@@ -238,14 +238,14 @@ int load_csr_from_mat(const char *path, CSRGraph *out)
   }
 
   mat_sparse_t *sparse = var->data;
-  int32_t n = (int32_t)var->dims[0];
-  int32_t mcols = (int32_t)var->dims[1];
+  uint32_t n = (uint32_t)var->dims[0];
+  uint32_t mcols = (uint32_t)var->dims[1];
 
-  int64_t nz = sparse->jc[mcols];
+  uint64_t nz = (uint64_t)sparse->jc[mcols];
 
   // Build CSR from column-compressed format in MATLAB (CSC)
-  int64_t *row_ptr = (int64_t *)calloc((size_t)n + 1, sizeof(int64_t));
-  int32_t *col_idx = (int32_t *)malloc(sizeof(int32_t) * nz);
+  uint64_t *row_ptr = (uint64_t *)calloc((size_t)n + 1, sizeof(uint64_t));
+  uint32_t *col_idx = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)nz);
   if (!row_ptr || !col_idx)
   {
     fprintf(stderr, "Memory allocation failed\n");
@@ -257,28 +257,28 @@ int load_csr_from_mat(const char *path, CSRGraph *out)
   }
 
   // Count entries per row
-  for (int c = 0; c < mcols; ++c)
+  for (uint32_t c = 0; c < mcols; ++c)
   {
-    for (int64_t j = sparse->jc[c]; j < sparse->jc[c + 1]; ++j)
+    for (uint64_t j = (uint64_t)sparse->jc[c]; j < (uint64_t)sparse->jc[c + 1]; ++j)
     {
       int r = sparse->ir[j];
-      if (r >= 0 && r < n)
+      if (r >= 0 && (uint32_t)r < n)
         row_ptr[r + 1]++;
     }
   }
-  for (int i = 0; i < n; ++i)
+  for (uint32_t i = 0; i < n; ++i)
     row_ptr[i + 1] += row_ptr[i];
 
   // Fill col_idx
-  int64_t *head = (int64_t *)malloc(sizeof(int64_t) * n);
-  memcpy(head, row_ptr, sizeof(int64_t) * n);
+  uint64_t *head = (uint64_t *)malloc(sizeof(uint64_t) * n);
+  memcpy(head, row_ptr, sizeof(uint64_t) * n);
 
-  for (int c = 0; c < mcols; ++c)
+  for (uint32_t c = 0; c < mcols; ++c)
   {
-    for (int64_t j = sparse->jc[c]; j < sparse->jc[c + 1]; ++j)
+    for (uint64_t j = (uint64_t)sparse->jc[c]; j < (uint64_t)sparse->jc[c + 1]; ++j)
     {
       int r = sparse->ir[j];
-      if (r < 0 || r >= n)
+      if (r < 0 || (uint32_t)r >= n)
         continue;
       col_idx[head[r]++] = c;
     }
