@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <limits.h>
 
 #include "graph.h"
 #include "mmio.h"
@@ -148,6 +149,57 @@ static void edgevec_free(EdgeVec *v)
     v->data = NULL;
     v->size = 0;
     v->capacity = 0;
+}
+
+/* Scatter column indices while respecting MPI count limits. */
+static void scatter_col_idx_large(const uint32_t *sendbuf,
+                                  const uint64_t *sendcounts,
+                                  const uint64_t *displs,
+                                  uint32_t *recvbuf,
+                                  uint64_t recvcount,
+                                  MPI_Comm comm)
+{
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+
+    const uint64_t chunk_limit = (uint64_t)INT_MAX;
+
+    if (rank == 0)
+    {
+        for (int r = 0; r < size; ++r)
+        {
+            uint64_t count = sendcounts ? sendcounts[r] : 0;
+            uint64_t offset = displs ? displs[r] : 0;
+
+            if (r == 0)
+            {
+                if (count > 0 && recvbuf)
+                {
+                    memcpy(recvbuf, sendbuf + offset, (size_t)count * sizeof(uint32_t));
+                }
+                continue;
+            }
+
+            uint64_t sent = 0;
+            while (sent < count)
+            {
+                int chunk = (int)((count - sent) > chunk_limit ? chunk_limit : (count - sent));
+                MPI_Send(sendbuf + offset + sent, chunk, MPI_UINT32_T, r, 0, comm);
+                sent += (uint64_t)chunk;
+            }
+        }
+    }
+    else
+    {
+        uint64_t received = 0;
+        while (received < recvcount)
+        {
+            int chunk = (int)((recvcount - received) > chunk_limit ? chunk_limit : (recvcount - received));
+            MPI_Recv(recvbuf + received, chunk, MPI_UINT32_T, 0, 0, comm, MPI_STATUS_IGNORE);
+            received += (uint64_t)chunk;
+        }
+    }
 }
 
 /**
@@ -428,13 +480,13 @@ static int load_dist_csr_from_file_rank0(const char *path,
     uint64_t m_local = (n_local > 0) ? local_row_ptr[n_local] : 0;
 
     /* Scatter col_idx segments: edges belonging to rows [v_start, v_end). */
-    int *sendcounts_colidx = NULL;
-    int *displs_colidx = NULL;
+    uint64_t *sendcounts_colidx = NULL;
+    uint64_t *displs_colidx = NULL;
 
     if (rank == 0)
     {
-        sendcounts_colidx = (int *)malloc((size_t)size * sizeof(int));
-        displs_colidx = (int *)malloc((size_t)size * sizeof(int));
+        sendcounts_colidx = (uint64_t *)malloc((size_t)size * sizeof(uint64_t));
+        displs_colidx = (uint64_t *)malloc((size_t)size * sizeof(uint64_t));
         if (!sendcounts_colidx || !displs_colidx)
         {
             fprintf(stderr, "Failed to allocate sendcounts_colidx/displs_colidx\n");
@@ -447,8 +499,8 @@ static int load_dist_csr_from_file_rank0(const char *path,
             compute_vertex_range(n_global, size, r, &s_v_start, &s_v_end);
             uint64_t row_begin = full.row_ptr[s_v_start];
             uint64_t row_end = full.row_ptr[s_v_end];
-            sendcounts_colidx[r] = (int)(row_end - row_begin);
-            displs_colidx[r] = (int)row_begin;
+            sendcounts_colidx[r] = row_end - row_begin;
+            displs_colidx[r] = row_begin;
         }
     }
 
@@ -463,15 +515,12 @@ static int load_dist_csr_from_file_rank0(const char *path,
         }
     }
 
-    MPI_Scatterv(rank == 0 ? full.col_idx : NULL,
-                 sendcounts_colidx,
-                 displs_colidx,
-                 MPI_UINT32_T,
-                 local_col_idx,
-                 (int)m_local,
-                 MPI_UINT32_T,
-                 0,
-                 comm);
+    scatter_col_idx_large(rank == 0 ? full.col_idx : NULL,
+                          sendcounts_colidx,
+                          displs_colidx,
+                          local_col_idx,
+                          m_local,
+                          comm);
 
     if (rank == 0)
     {
