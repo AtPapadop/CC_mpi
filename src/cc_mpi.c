@@ -5,12 +5,12 @@
 #include "cc_mpi.h"
 
 #include <mpi.h>
+#include <omp.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "graph.h"
 #include "cc.h"              /* compute_connected_components_pthreads() */
@@ -29,10 +29,11 @@ static void die_abort(MPI_Comm comm, const char *msg)
     MPI_Abort(comm, EXIT_FAILURE);
 }
 
+/* Use OpenMP thread setting as the pthread count to avoid oversubscription. */
 static int default_num_threads(void)
 {
-    long t = sysconf(_SC_NPROCESSORS_ONLN);
-    return (t > 0) ? (int)t : 1;
+    int t = omp_get_max_threads(); /* respects OMP_NUM_THREADS */
+    return (t > 0) ? t : 1;
 }
 
 /* Must match the same block partition as your DistCSRGraph loader */
@@ -56,85 +57,14 @@ static int owner_of_vertex(uint32_t v, uint32_t n_global, int comm_size)
     return (int)(rem + (uint32_t)(shifted / base));
 }
 
-/* sort compare */
-static int cmp_u32(const void *a, const void *b)
+/* compare BoundaryEdge by (remote, rep) so all remotes group together */
+static int cmp_be_remote_first(const void *a, const void *b)
 {
-    uint32_t x = *(const uint32_t*)a;
-    uint32_t y = *(const uint32_t*)b;
-    return (x<y)?-1:(x>y)?1:0;
-}
-
-/* lower_bound on sorted uint32_t array */
-static uint32_t lower_bound_u32(const uint32_t *arr, uint32_t n, uint32_t key, int *found)
-{
-    uint32_t lo=0, hi=n;
-    while (lo<hi)
-    {
-        uint32_t mid = lo + (hi-lo)/2;
-        uint32_t v = arr[mid];
-        if (v < key) lo = mid+1;
-        else hi = mid;
-    }
-    if (found) *found = (lo < n && arr[lo] == key);
-    return lo;
-}
-
-/* compare BoundaryEdge */
-static int cmp_be(const void *a, const void *b)
-{
-    const BoundaryEdge *x=(const BoundaryEdge*)a;
-    const BoundaryEdge *y=(const BoundaryEdge*)b;
-    if (x->rep != y->rep) return (x->rep<y->rep)?-1:1;
-    if (x->remote != y->remote) return (x->remote<y->remote)?-1:1;
+    const BoundaryEdge *x = (const BoundaryEdge*)a;
+    const BoundaryEdge *y = (const BoundaryEdge*)b;
+    if (x->remote != y->remote) return (x->remote < y->remote) ? -1 : 1;
+    if (x->rep    != y->rep)    return (x->rep    < y->rep)    ? -1 : 1;
     return 0;
-}
-
-/* compare BoundaryPair */
-static int cmp_bp(const void *a, const void *b)
-{
-    const BoundaryPair *x=(const BoundaryPair*)a;
-    const BoundaryPair *y=(const BoundaryPair*)b;
-    if (x->rep != y->rep) return (x->rep<y->rep)?-1:1;
-    if (x->gidx != y->gidx) return (x->gidx<y->gidx)?-1:1;
-    return 0;
-}
-
-/* rebuild boundary pairs (rep,gidx) from boundary edges (rep,remote) */
-static void rebuild_boundary_pairs(BPVec *pairs,
-                                   const BEVec *edges,
-                                   const uint32_t *ghost_vertices,
-                                   uint32_t ghost_count,
-                                   MPI_Comm comm)
-{
-    pairs->size = 0;
-
-    if (edges->size == 0 || ghost_count == 0) return;
-
-    for (uint64_t i=0; i<edges->size; ++i)
-    {
-        uint32_t rep = edges->data[i].rep;
-        uint32_t rv  = edges->data[i].remote;
-
-        int found=0;
-        uint32_t gidx = lower_bound_u32(ghost_vertices, ghost_count, rv, &found);
-        if (!found) continue; /* if missing, it'll be added later via ghost expansion */
-        bpvec_push(pairs, (BoundaryPair){rep, gidx}, comm);
-    }
-
-    if (pairs->size > 1)
-    {
-        qsort(pairs->data, (size_t)pairs->size, sizeof(BoundaryPair), cmp_bp);
-
-        uint64_t w=0;
-        for (uint64_t i=0; i<pairs->size; ++i)
-        {
-            if (i==0 ||
-                pairs->data[i].rep  != pairs->data[w-1].rep ||
-                pairs->data[i].gidx != pairs->data[w-1].gidx)
-                pairs->data[w++] = pairs->data[i];
-        }
-        pairs->size = w;
-    }
 }
 
 /* get label of a GLOBAL vertex x:
@@ -158,12 +88,21 @@ static inline uint32_t get_vertex_label_global(uint32_t x,
         return comp_label[rep];
     }
 
-    int found=0;
-    uint32_t gidx = lower_bound_u32(ghost_vertices, ghost_count, x, &found);
-    if (found)
+    /* NOTE: in this version, we DO NOT do dynamic ghost expansion,
+       so any "parent" jump should always be either local or already in ghost list.
+       We'll do binary search only for pointer-jump. */
+    uint32_t lo=0, hi=ghost_count;
+    while (lo < hi)
+    {
+        uint32_t mid = lo + (hi-lo)/2;
+        uint32_t v = ghost_vertices[mid];
+        if (v < x) lo = mid+1;
+        else hi = mid;
+    }
+    if (lo < ghost_count && ghost_vertices[lo] == x)
     {
         if (missing) *missing = 0;
-        return ghost_labels[gidx];
+        return ghost_labels[lo];
     }
 
     if (missing) *missing = 1;
@@ -192,15 +131,14 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     if (n_global == 0) return;
 
+    double t0_total = MPI_Wtime();
+
     /* ---------------- Phase 1: induced local-only graph + pthread CC ---------------- */
 
     uint64_t *lrow = (uint64_t*)calloc((size_t)n_local + 1, sizeof(uint64_t));
     if (!lrow && n_local>0) die_abort(comm, "OOM: lrow");
 
-    U32Vec ghosts_tmp; u32vec_init(&ghosts_tmp);
-    BEVec boundary_edges; bevec_init(&boundary_edges);
-
-    /* count local-only edges + collect remote neighbors as initial ghosts */
+    /* count local-only edges */
     for (uint32_t li=0; li<n_local; ++li)
     {
         uint64_t begin = row_ptr[li];
@@ -212,8 +150,6 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
             uint32_t v = col_idx[j];
             if (v >= v_start && v < v_end)
                 cnt_local++;
-            else if (v < n_global)
-                u32vec_push(&ghosts_tmp, v, comm);
         }
         lrow[li+1] = lrow[li] + cnt_local;
     }
@@ -248,6 +184,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     Glocal.col_idx = lcol;
 
     uint32_t *comp_of = NULL; /* local vertex -> local representative (min local id) */
+
     if (n_local > 0)
     {
         comp_of = (uint32_t*)malloc((size_t)n_local * sizeof(uint32_t));
@@ -256,14 +193,20 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
         int num_threads = default_num_threads();
         if (num_threads < 1) num_threads = 1;
 
+        double t_cc0 = MPI_Wtime();
         compute_connected_components_pthreads(&Glocal, comp_of, num_threads, chunk_size);
+        double t_cc1 = MPI_Wtime();
+
+        fprintf(stderr, "[rank %d] Local CC done: n_local=%u m_local_local=%llu threads=%d time=%.3fs\n",
+                comm_rank, n_local, (unsigned long long)m_local_local, num_threads, t_cc1 - t_cc0);
+        fflush(stderr);
     }
 
     free(lrow); free(lcol);
     Glocal.row_ptr = NULL;
     Glocal.col_idx = NULL;
 
-    /* component rep list */
+    /* rep list + labels */
     uint8_t *is_rep = NULL;
     U32VecI rep_list; u32veci_init(&rep_list);
 
@@ -292,7 +235,13 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
         }
     }
 
-    /* build boundary edges using comp_of */
+    /* ---------------- Boundary edges (ONLY) ----------------
+       We DO NOT build ghosts_tmp.
+       We will build ghost_vertices from boundary_edges later in linear time. */
+    double t_b0 = MPI_Wtime();
+
+    BEVec boundary_edges; bevec_init(&boundary_edges);
+
     if (n_local > 0)
     {
         for (uint32_t li=0; li<n_local; ++li)
@@ -307,67 +256,84 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                 uint32_t v = col_idx[j];
                 if (v >= v_start && v < v_end) continue;
                 if (v >= n_global) continue;
+                /* store (rep, remote_global) */
                 bevec_push(&boundary_edges, (BoundaryEdge){rep, v}, comm);
             }
         }
 
         if (boundary_edges.size > 1)
         {
-            qsort(boundary_edges.data, (size_t)boundary_edges.size, sizeof(BoundaryEdge), cmp_be);
+            qsort(boundary_edges.data, (size_t)boundary_edges.size, sizeof(BoundaryEdge), cmp_be_remote_first);
 
+            /* dedup identical (remote,rep) */
             uint64_t w=0;
             for (uint64_t i=0; i<boundary_edges.size; ++i)
             {
                 if (i==0 ||
-                    boundary_edges.data[i].rep    != boundary_edges.data[w-1].rep ||
-                    boundary_edges.data[i].remote != boundary_edges.data[w-1].remote)
+                    boundary_edges.data[i].remote != boundary_edges.data[w-1].remote ||
+                    boundary_edges.data[i].rep    != boundary_edges.data[w-1].rep)
+                {
                     boundary_edges.data[w++] = boundary_edges.data[i];
+                }
             }
             boundary_edges.size = w;
         }
     }
 
-    /* ---------------- Ghost set: sort+unique ghosts_tmp into ghost_vertices ---------------- */
+    double t_b1 = MPI_Wtime();
+    fprintf(stderr, "[rank %d] boundary_edges=%llu build_boundary=%.3fs\n",
+            comm_rank, (unsigned long long)boundary_edges.size, t_b1 - t_b0);
+    fflush(stderr);
 
-    uint32_t *ghost_vertices = NULL;
+    /* ---------------- Build ghost list + map in ONE LINEAR PASS ---------------- */
+
+    double t_g0 = MPI_Wtime();
+
     uint32_t ghost_count = 0;
+    uint32_t *ghost_vertices = NULL;
+    uint32_t *ghost_labels   = NULL;
 
-    if (ghosts_tmp.size > 0)
+    if (boundary_edges.size > 0)
     {
-        qsort(ghosts_tmp.data, (size_t)ghosts_tmp.size, sizeof(uint32_t), cmp_u32);
+        /* worst-case: each boundary edge has unique remote -> allocate that */
+        ghost_vertices = (uint32_t*)malloc((size_t)boundary_edges.size * sizeof(uint32_t));
+        if (!ghost_vertices) die_abort(comm, "OOM: ghost_vertices");
 
-        uint64_t w=0;
-        for (uint64_t i=0; i<ghosts_tmp.size; ++i)
+        uint32_t prev = UINT32_MAX;
+
+        for (uint64_t e=0; e<boundary_edges.size; ++e)
         {
-            if (i==0 || ghosts_tmp.data[i] != ghosts_tmp.data[w-1])
-                ghosts_tmp.data[w++] = ghosts_tmp.data[i];
+            uint32_t rv = boundary_edges.data[e].remote; /* remote global */
+            if (rv != prev)
+            {
+                ghost_vertices[ghost_count++] = rv;
+                prev = rv;
+            }
+            /* overwrite remote field with ghost index */
+            boundary_edges.data[e].remote = ghost_count - 1;
         }
 
-        if (w > (uint64_t)UINT32_MAX) die_abort(comm, "Too many ghosts");
-        ghost_count = (uint32_t)w;
-        ghost_vertices = ghosts_tmp.data;
-        ghosts_tmp.data = NULL;
-        ghosts_tmp.size = ghosts_tmp.cap = 0;
-    }
-    u32vec_free(&ghosts_tmp);
+        /* shrink to fit */
+        uint32_t *shrunk = (uint32_t*)realloc(ghost_vertices, (size_t)ghost_count * sizeof(uint32_t));
+        if (shrunk) ghost_vertices = shrunk;
 
-    uint32_t *ghost_labels = NULL;
-    if (ghost_count > 0)
-    {
         ghost_labels = (uint32_t*)malloc((size_t)ghost_count * sizeof(uint32_t));
         if (!ghost_labels) die_abort(comm, "OOM: ghost_labels");
         for (uint32_t i=0; i<ghost_count; ++i) ghost_labels[i] = ghost_vertices[i];
     }
 
-    BPVec boundary_pairs; bpvec_init(&boundary_pairs);
-    rebuild_boundary_pairs(&boundary_pairs, &boundary_edges, ghost_vertices, ghost_count, comm);
+    double t_g1 = MPI_Wtime();
+
+    fprintf(stderr, "[rank %d] ghost_count=%u build_ghosts+map=%.3fs\n",
+            comm_rank, ghost_count, t_g1 - t_g0);
+    fflush(stderr);
 
     /* ---------------- Phase 2: SV-ish merge (hook + pointer-jumping) ---------------- */
 
     bool global_changed = false;
     int merge_rounds = 0;
 
-    if (n_local > 0 && ghost_count > 0 && boundary_pairs.size > 0)
+    if (n_local > 0 && ghost_count > 0 && boundary_edges.size > 0)
         global_changed = true;
 
     ExchangePlan plan;
@@ -375,9 +341,28 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     if (ghost_count > 0)
         exchangeplan_build(&plan, ghost_vertices, ghost_count, n_global, comm, owner_of_vertex);
 
+    fprintf(stderr, "[rank %d] plan built indegree=%d outdegree=%d send=%d recv=%d\n",
+            comm_rank, plan.indegree, plan.outdegree, plan.total_send_to, plan.total_need_from);
+    fflush(stderr);
+
+    if (comm_rank == 1)
+    {
+        fprintf(stderr, "[rank 1] DEBUG: ghost_count=%u boundary_edges=%llu reps=%d\n",
+                ghost_count, (unsigned long long)boundary_edges.size, rep_list.size);
+        fflush(stderr);
+    }
+
+    /* Make iteration-1 exchange timing reflect comm, not "waiting for last rank" */
+    MPI_Barrier(comm);
+
+    const int MAX_JUMPS = 4;
+
     while (global_changed)
     {
+        double it0 = MPI_Wtime();
+
         /* (A) Pack outgoing labels for vertices other ranks request from us */
+        double t_pack0 = MPI_Wtime();
         if (plan.total_send_to > 0)
         {
             for (int i=0; i<plan.total_send_to; ++i)
@@ -394,11 +379,15 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                 plan.send_labels_flat[i] = lbl;
             }
         }
+        double t_pack1 = MPI_Wtime();
 
         /* (B) Exchange; updates ghost_labels */
+        double t_ex0 = MPI_Wtime();
         exchangeplan_exchange(&plan, ghost_labels, comm);
+        double t_ex1 = MPI_Wtime();
 
         /* (C) Hooking */
+        double t_hook0 = MPI_Wtime();
         bool local_changed = false;
 
         for (int k=0; k<rep_list.size; ++k)
@@ -407,19 +396,17 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
             comp_min[rep] = comp_label[rep];
         }
 
-        for (uint64_t e=0; e<boundary_pairs.size; ++e)
+        for (uint64_t e=0; e<boundary_edges.size; ++e)
         {
-            uint32_t rep  = boundary_pairs.data[e].rep;
-            uint32_t gidx = boundary_pairs.data[e].gidx;
+            uint32_t rep  = boundary_edges.data[e].rep;
+            uint32_t gidx = boundary_edges.data[e].remote; /* now ghost index */
             uint32_t nlbl = ghost_labels[gidx];
             if (nlbl < comp_min[rep]) comp_min[rep] = nlbl;
         }
+        double t_hook1 = MPI_Wtime();
 
-        /* (D) Pointer jumping with dynamic “parent ghost” discovery */
-        const int MAX_JUMPS = 4;
-
-        U32Vec new_parents; u32vec_init(&new_parents);
-        bool need_rebuild = false;
+        /* (D) Pointer jumping (no dynamic ghost expansion in this version) */
+        double t_jump0 = MPI_Wtime();
 
         for (int k=0; k<rep_list.size; ++k)
         {
@@ -435,15 +422,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                                                      ghost_vertices, ghost_count,
                                                      ghost_labels,
                                                      &missing);
-                if (missing)
-                {
-                    if (!(x >= v_start && x < v_end) && x < n_global)
-                    {
-                        u32vec_push(&new_parents, x, comm);
-                        need_rebuild = true;
-                    }
-                    break;
-                }
+                if (missing) break;
                 if (y >= x) break;
                 x = y;
             }
@@ -461,72 +440,30 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
             }
         }
 
-        /* Expand ghost set and rebuild plan/pairs if needed */
-        if (need_rebuild && new_parents.size > 0)
-        {
-            qsort(new_parents.data, (size_t)new_parents.size, sizeof(uint32_t), cmp_u32);
-
-            uint64_t w=0;
-            for (uint64_t i=0; i<new_parents.size; ++i)
-            {
-                if (i==0 || new_parents.data[i] != new_parents.data[w-1])
-                    new_parents.data[w++] = new_parents.data[i];
-            }
-            new_parents.size = w;
-
-            uint32_t merged_cap = ghost_count + (uint32_t)new_parents.size;
-            uint32_t *merged = (uint32_t*)malloc((size_t)merged_cap * sizeof(uint32_t));
-            if (!merged) die_abort(comm, "OOM: merged ghosts");
-
-            uint32_t i=0, j=0, m=0;
-            while (i<ghost_count && j<(uint32_t)new_parents.size)
-            {
-                uint32_t a = ghost_vertices[i];
-                uint32_t b = new_parents.data[j];
-                if (a < b) merged[m++] = a, i++;
-                else if (b < a) merged[m++] = b, j++;
-                else merged[m++] = a, i++, j++;
-            }
-            while (i<ghost_count) merged[m++] = ghost_vertices[i++];
-            while (j<(uint32_t)new_parents.size) merged[m++] = new_parents.data[j++];
-
-            uint32_t *new_labels = (uint32_t*)malloc((size_t)m * sizeof(uint32_t));
-            if (!new_labels) die_abort(comm, "OOM: new ghost_labels");
-
-            for (uint32_t t=0; t<m; ++t) new_labels[t] = merged[t];
-
-            for (uint32_t old=0; old<ghost_count; ++old)
-            {
-                uint32_t v = ghost_vertices[old];
-                int found=0;
-                uint32_t idx = lower_bound_u32(merged, m, v, &found);
-                if (found) new_labels[idx] = ghost_labels[old];
-            }
-
-            free(ghost_vertices);
-            free(ghost_labels);
-
-            ghost_vertices = merged;
-            ghost_labels   = new_labels;
-            ghost_count    = m;
-
-            exchangeplan_free(&plan);
-            exchangeplan_build(&plan, ghost_vertices, ghost_count, n_global, comm, owner_of_vertex);
-
-            boundary_pairs.size = 0;
-            rebuild_boundary_pairs(&boundary_pairs, &boundary_edges, ghost_vertices, ghost_count, comm);
-
-            local_changed = true;
-        }
-
-        u32vec_free(&new_parents);
+        double t_jump1 = MPI_Wtime();
 
         MPI_Allreduce(&local_changed, &global_changed, 1, MPI_C_BOOL, MPI_LOR, comm);
         ++merge_rounds;
+
+        double it1 = MPI_Wtime();
+
+        if (merge_rounds <= 3 || (merge_rounds % 10 == 0))
+        {
+            fprintf(stderr,
+                    "[rank %d] iter=%d pack=%.3fs exch=%.3fs hook=%.3fs jump=%.3fs total=%.3fs changed=%d\n",
+                    comm_rank, merge_rounds,
+                    t_pack1 - t_pack0,
+                    t_ex1   - t_ex0,
+                    t_hook1 - t_hook0,
+                    t_jump1 - t_jump0,
+                    it1 - it0,
+                    (int)local_changed);
+            fflush(stderr);
+        }
     }
 
     if (comm_rank == 0)
-        fprintf(stderr, "CC merge(SV hook+jump) converged in %d rounds\n", merge_rounds);
+        fprintf(stderr, "CC merge(hook+jump) converged in %d rounds\n", merge_rounds);
 
     /* ---------------- Final per-vertex labels + allgather ---------------- */
 
@@ -570,7 +507,6 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     exchangeplan_free(&plan);
 
-    bpvec_free(&boundary_pairs);
     bevec_free(&boundary_edges);
 
     free(ghost_vertices);
@@ -582,6 +518,11 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     free(is_rep);
     u32veci_free(&rep_list);
+
+    double t1_total = MPI_Wtime();
+    fprintf(stderr, "[rank %d] compute_connected_components_mpi_advanced total=%.3fs\n",
+            comm_rank, t1_total - t0_total);
+    fflush(stderr);
 }
 
 /* unchanged helper */

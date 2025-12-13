@@ -59,9 +59,6 @@ void exchangeplan_free(ExchangePlan *P)
 {
     if (!P) return;
 
-    if (P->comm_graph != MPI_COMM_NULL)
-        MPI_Comm_free(&P->comm_graph);
-
     free(P->sources);
     free(P->dests);
 
