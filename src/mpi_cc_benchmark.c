@@ -3,37 +3,41 @@
 #include <getopt.h>
 #include <limits.h>
 #include <mpi.h>
-#include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <unistd.h>
 
 #include "graph_dist.h"
 #include "cc_mpi.h"
 #include "opt_parser.h"
 #include "results_writer.h"
 
-/**
- * Print usage information.
- */
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
             "Usage: %s [OPTIONS] <matrix-file-path>\n\n"
             "Options:\n"
             "  -c, --chunk-size SPEC       Chunk size list/range\n"
-            "                               (e.g., 2048 or 512,1024 or 512:4096:512)\n"
             "  -e, --exchange SPEC         Exchange interval list/range\n"
             "  -r, --runs N                Runs per configuration (default 1)\n"
             "  -o, --output DIR            Output directory (default 'results')\n"
+            "  -t, --threads N             Pthreads per rank (default: all cores)\n"
             "  -h, --help                  Show help message\n",
             prog);
 }
 
-/**
- * Main entry point for MPI connected components benchmark.
- */
+static int default_num_threads(void)
+{
+#ifdef _SC_NPROCESSORS_ONLN
+    long t = sysconf(_SC_NPROCESSORS_ONLN);
+    return (t > 0) ? (int)t : 1;
+#else
+    return 1;
+#endif
+}
+
 int main(int argc, char **argv)
 {
     MPI_Init(&argc, &argv);
@@ -43,59 +47,53 @@ int main(int argc, char **argv)
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
 
-    // Use all CPU cores per rank.
-    int threads_available = omp_get_max_threads();
-    omp_set_num_threads(threads_available);
-
-    // ---------------------------------------------------------
-    // Parse CLI options
-    // ---------------------------------------------------------
     const char *chunk_spec = "2048";
     const char *exchange_spec = "1";
     int runs = 1;
     const char *output_dir = "results";
     const char *matrix_path = NULL;
+    int threads_opt = 0; /* 0 => default */
 
     const struct option long_opts[] = {
         {"chunk-size", required_argument, NULL, 'c'},
         {"exchange", required_argument, NULL, 'e'},
         {"runs", required_argument, NULL, 'r'},
         {"output", required_argument, NULL, 'o'},
+        {"threads", required_argument, NULL, 't'},
         {"help", no_argument, NULL, 'h'},
-        {NULL, 0, NULL, 0}};
+        {NULL, 0, NULL, 0}
+    };
 
     int opt, idx;
-    while ((opt = getopt_long(argc, argv, "c:e:r:o:h", long_opts, &idx)) != -1)
+    while ((opt = getopt_long(argc, argv, "c:e:r:o:t:h", long_opts, &idx)) != -1)
     {
         switch (opt)
         {
-        case 'c':
-            chunk_spec = optarg;
-            break;
-        case 'e':
-            exchange_spec = optarg;
-            break;
+        case 'c': chunk_spec = optarg; break;
+        case 'e': exchange_spec = optarg; break;
         case 'r':
-            if (opt_parse_positive_int(optarg, &runs) != 0 ||
-                runs <= 0)
+            if (opt_parse_positive_int(optarg, &runs) != 0 || runs <= 0)
             {
-                if (rank == 0)
-                    fprintf(stderr, "Invalid runs: %s\n", optarg);
+                if (rank == 0) fprintf(stderr, "Invalid runs: %s\n", optarg);
                 MPI_Finalize();
                 return EXIT_FAILURE;
             }
             break;
-        case 'o':
-            output_dir = optarg;
+        case 'o': output_dir = optarg; break;
+        case 't':
+            if (opt_parse_positive_int(optarg, &threads_opt) != 0 || threads_opt <= 0)
+            {
+                if (rank == 0) fprintf(stderr, "Invalid threads: %s\n", optarg);
+                MPI_Finalize();
+                return EXIT_FAILURE;
+            }
             break;
         case 'h':
-            if (rank == 0)
-                print_usage(argv[0]);
+            if (rank == 0) print_usage(argv[0]);
             MPI_Finalize();
             return EXIT_SUCCESS;
         default:
-            if (rank == 0)
-                print_usage(argv[0]);
+            if (rank == 0) print_usage(argv[0]);
             MPI_Finalize();
             return EXIT_FAILURE;
         }
@@ -111,86 +109,67 @@ int main(int argc, char **argv)
         MPI_Finalize();
         return EXIT_FAILURE;
     }
-
     matrix_path = argv[optind];
 
-    if (rank == 0)
-        printf("MPI CC Benchmark (MPI ranks=%d, OMP threads/rank=%d)\n",
-               size, threads_available);
+    int threads_default = default_num_threads();
+    int threads_to_use = (threads_opt > 0) ? threads_opt : threads_default;
+    if (threads_to_use < 1) threads_to_use = 1;
 
-    // ---------------------------------------------------------
-    // Ensure output directory
-    // ---------------------------------------------------------
-    if (rank == 0 &&
-        results_writer_ensure_directory(output_dir) != 0)
+    /* tell CC code what to use */
+    cc_mpi_set_num_threads(threads_to_use);
+
+    if (rank == 0)
+        printf("MPI CC Benchmark (MPI ranks=%d, pthreads/rank=%d)\n",
+               size, threads_to_use);
+
+    if (rank == 0 && results_writer_ensure_directory(output_dir) != 0)
     {
-        fprintf(stderr,
-                "Failed to create output directory '%s': %s\n",
+        fprintf(stderr, "Failed to create output directory '%s': %s\n",
                 output_dir, strerror(errno));
         MPI_Finalize();
         return EXIT_FAILURE;
     }
 
-    // ---------------------------------------------------------
-    // Parse chunk-size list
-    // ---------------------------------------------------------
     OptIntList chunk_sizes;
     opt_int_list_init(&chunk_sizes);
     if (opt_parse_range_list(chunk_spec, &chunk_sizes, "chunk sizes") != 0)
     {
-        if (rank == 0)
-            fprintf(stderr, "Invalid chunk-size specification.\n");
+        if (rank == 0) fprintf(stderr, "Invalid chunk-size specification.\n");
         MPI_Finalize();
         return EXIT_FAILURE;
     }
 
-    // ---------------------------------------------------------
-    // Parse exchange-interval list
-    // ---------------------------------------------------------
     OptIntList exchange_intervals;
     opt_int_list_init(&exchange_intervals);
     if (opt_parse_range_list(exchange_spec, &exchange_intervals, "exchange intervals") != 0)
     {
-        if (rank == 0)
-            fprintf(stderr, "Invalid exchange interval specification.\n");
+        if (rank == 0) fprintf(stderr, "Invalid exchange interval specification.\n");
         opt_int_list_free(&chunk_sizes);
         MPI_Finalize();
         return EXIT_FAILURE;
     }
 
-    // ---------------------------------------------------------
-    // Allocate results CSV file path (rank 0 only)
-    // ---------------------------------------------------------
     char results_path[PATH_MAX];
     if (rank == 0)
     {
         if (results_writer_build_results_path(results_path, sizeof(results_path),
-                                              output_dir,
-                                              "results_mpi",
+                                              output_dir, "results_mpi",
                                               matrix_path) != 0)
         {
             fprintf(stderr, "Failed to build results path.\n");
             MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         }
-
         printf("Saving results to: %s\n", results_path);
     }
 
-    // ---------------------------------------------------------
-    // Timing buffer
-    // ---------------------------------------------------------
     double *run_times = malloc((size_t)runs * sizeof(double));
     if (!run_times)
     {
-        if (rank == 0)
-            fprintf(stderr, "Memory allocation failed (run_times).\n");
+        if (rank == 0) fprintf(stderr, "Memory allocation failed (run_times).\n");
         MPI_Finalize();
         return EXIT_FAILURE;
     }
 
-    // -------------------------------------------------
-    // Load distributed graph
-    // -------------------------------------------------
     MPI_Barrier(comm);
     DistCSRGraph Gd;
     double t_load_start = MPI_Wtime();
@@ -199,8 +178,7 @@ int main(int argc, char **argv)
 
     if (rc != 0)
     {
-        if (rank == 0)
-            fprintf(stderr, "Error loading graph.\n");
+        if (rank == 0) fprintf(stderr, "Error loading graph.\n");
         MPI_Abort(comm, EXIT_FAILURE);
     }
 
@@ -208,17 +186,6 @@ int main(int argc, char **argv)
         printf("Graph loaded (n=%" PRIu32 ", m=%" PRIu64 ") in %.6f seconds.\n",
                Gd.n_global, Gd.m_global, t_load_end - t_load_start);
 
-    // Labels buffer for all ranks
-    uint32_t *labels_global = malloc((size_t)Gd.n_global * sizeof(uint32_t));
-    if (!labels_global)
-    {
-        fprintf(stderr, "[rank %d] Failed to allocate labels_global.\n", rank);
-        MPI_Abort(comm, EXIT_FAILURE);
-    }
-
-    // ---------------------------------------------------------
-    // Benchmark loop: all combinations
-    // ---------------------------------------------------------
     for (size_t ci = 0; ci < chunk_sizes.size; ci++)
     {
         int chunk = chunk_sizes.values[ci];
@@ -231,31 +198,23 @@ int main(int argc, char **argv)
                 printf("\n=== Testing chunk=%d, exchange=%d (%d run%s) ===\n",
                        chunk, exchange, runs, runs == 1 ? "" : "s");
 
-            // -------------------------------------------------
-            // Run CC multiple times
-            // -------------------------------------------------
             for (int r = 0; r < runs; r++)
             {
                 MPI_Barrier(comm);
                 double t0 = MPI_Wtime();
 
-                compute_connected_components_mpi_advanced(
-                    &Gd, labels_global, chunk, exchange, comm);
+                compute_connected_components_mpi_advanced(&Gd, NULL, chunk, exchange, comm);
 
                 double t1 = MPI_Wtime();
                 run_times[r] = t1 - t0;
 
-                if (rank == 0){
+                if (rank == 0)
+                {
                     printf("Run %d: %.6f seconds\n", r + 1, run_times[r]);
-                    printf("Number of connected components: %"PRIu32"\n",
-                           count_connected_components(labels_global, Gd.n_global));
+                    printf("(component count printed by CC via MPI_Reduce)\n");
                 }
-                    
             }
 
-            // -------------------------------------------------
-            // Save timings to CSV (rank 0 only)
-            // -------------------------------------------------
             if (rank == 0)
             {
                 char colname[128];
@@ -276,18 +235,12 @@ int main(int argc, char **argv)
         }
     }
 
-    free(labels_global);
     free_dist_csr(&Gd);
-
-    // ---------------------------------------------------------
-    // Cleanup
-    // ---------------------------------------------------------
     free(run_times);
     opt_int_list_free(&chunk_sizes);
     opt_int_list_free(&exchange_intervals);
 
-    if (rank == 0)
-        printf("\nAll tests completed.\n");
+    if (rank == 0) printf("\nAll tests completed.\n");
 
     MPI_Finalize();
     return EXIT_SUCCESS;

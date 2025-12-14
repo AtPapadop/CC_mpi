@@ -34,4 +34,6 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
 uint32_t count_connected_components(const uint32_t *restrict labels_global, uint32_t n_global);
 
+void cc_mpi_set_num_threads(int nthreads);
+
 #endif /* CC_MPI_H */

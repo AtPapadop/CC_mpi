@@ -73,7 +73,15 @@ extern "C"
    * ghost_labels must be indexed by ghost index corresponding to ghost_vertices used in build().
    */
   void exchangeplan_exchange(ExchangePlan *P, uint32_t *ghost_labels, MPI_Comm comm);
-
+  void exchangeplan_exchange_delta(const ExchangePlan *P,
+                                        const uint32_t *comp_label,
+                                        const uint32_t *comp_of,
+                                        uint32_t v_start, uint32_t v_end,
+                                        uint32_t *prev_sent,          /* length P->total_send_to */
+                                        uint32_t *ghost_labels,       /* length ghost_count */
+                                        MPI_Comm comm,
+                                        uint64_t **sendbuf_io, int *sendcap_io,
+                                        uint64_t **recvbuf_io, int *recvcap_io);
 #ifdef __cplusplus
 }
 #endif
