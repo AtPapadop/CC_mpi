@@ -173,7 +173,7 @@ int main(int argc, char **argv)
     MPI_Barrier(comm);
     DistCSRGraph Gd;
     double t_load_start = MPI_Wtime();
-    int rc = load_dist_csr_from_file(matrix_path, 1, 1, 1, 1, &Gd, comm);
+    int rc = load_dist_csr_from_file(matrix_path, 1, 1, 1, &Gd, comm);
     double t_load_end = MPI_Wtime();
 
     if (rc != 0)
