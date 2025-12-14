@@ -22,6 +22,9 @@ typedef struct
   uint32_t v_end;    // global vertex ID of the last vertex owned by this rank (exclusive)
   uint64_t *row_ptr; // local row pointers (size n_local + 1)
   uint32_t *col_idx; // column indices (global vertex IDs)
+  uint32_t *part_bounds; // partition boundaries (size comm_size + 1), optional
+  int part_size;        // number of partitions (comm_size)
+  int part_kind;       // partitioning kind: 0=vertex-balanced, 1=edge-balanced
 } DistCSRGraph;
 
 /**
@@ -38,6 +41,7 @@ typedef struct
 int load_dist_csr_from_file(const char *path,
                             int symmetrize,
                             int drop_self_loops,
+                            int use_edge,
                             DistCSRGraph *out,
                             MPI_Comm comm);
 

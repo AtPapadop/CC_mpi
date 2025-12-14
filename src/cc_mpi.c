@@ -54,8 +54,34 @@ static int default_num_threads(void)
 }
 
 /* Must match DistCSRGraph partitioning (contiguous blocks) */
+static const uint32_t *g_part_bounds = NULL;
+static int g_part_size = 0;
+static int g_part_kind = 0; /* 0=vertex-balanced, 1=edge-balanced */
+
 static int owner_of_vertex(uint32_t v, uint32_t n_global, int comm_size)
 {
+    /* If graph_dist provided edge-balanced bounds, use them. */
+    if (g_part_kind != 0 && g_part_bounds && g_part_size == comm_size && comm_size > 1)
+    {
+        /* bounds length is comm_size+1, monotone increasing. */
+        int lo = 0;
+        int hi = comm_size - 1;
+        while (lo <= hi)
+        {
+            int mid = lo + ((hi - lo) >> 1);
+            uint32_t a = g_part_bounds[mid];
+            uint32_t b = g_part_bounds[mid + 1];
+            if (v < a)
+                hi = mid - 1;
+            else if (v >= b)
+                lo = mid + 1;
+            else
+                return mid;
+        }
+        /* Fallback (should not happen if bounds cover [0,n_global]) */
+        return (v >= g_part_bounds[comm_size]) ? (comm_size - 1) : 0;
+    }
+
     if (comm_size <= 1) return 0;
 
     uint32_t cs   = (uint32_t)comm_size;
@@ -325,6 +351,11 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     int rank = 0, size = 1;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
+
+    /* Partition-aware owner mapping (needed when using edge-balanced bounds). */
+    g_part_kind = Gd->part_kind;
+    g_part_size = Gd->part_size;
+    g_part_bounds = Gd->part_bounds;
 
     const uint32_t n_global = Gd->n_global;
     const uint32_t v_start  = Gd->v_start;

@@ -55,12 +55,14 @@ static void vpush(U32Vec *v, uint32_t x, MPI_Comm comm)
 
 static int *ensure_aligned_int(int *ptr, int *cap, int need)
 {
-    if (*cap >= need) return ptr;
+    if (*cap >= need)
+        return ptr;
 
-    if (ptr) free(ptr);
+    if (ptr)
+        free(ptr);
 
     int *p = NULL;
-    if (posix_memalign((void**)&p, 64, (size_t)need * sizeof(int)) != 0)
+    if (posix_memalign((void **)&p, 64, (size_t)need * sizeof(int)) != 0)
         return NULL;
 
     *cap = need;
@@ -286,9 +288,8 @@ static inline uint64_t pack_pair_u32(uint32_t pos, uint32_t lbl)
 {
     return (((uint64_t)pos) << 32) | (uint64_t)lbl;
 }
-static inline uint32_t pair_pos(uint64_t x){ return (uint32_t)(x >> 32); }
-static inline uint32_t pair_lbl(uint64_t x){ return (uint32_t)(x & 0xFFFFFFFFu); }
-
+static inline uint32_t pair_pos(uint64_t x) { return (uint32_t)(x >> 32); }
+static inline uint32_t pair_lbl(uint64_t x) { return (uint32_t)(x & 0xFFFFFFFFu); }
 
 void exchangeplan_exchange(ExchangePlan *P, uint32_t *ghost_labels, MPI_Comm comm)
 {
@@ -324,45 +325,75 @@ void exchangeplan_exchange_delta(const ExchangePlan *P,
     if (!P || P->comm_graph == MPI_COMM_NULL)
         return;
 
-    /* counts per neighbor (in neighbor order) */
-    int outd = P->outdegree;
-    int ind = P->indegree;
+    const int outd = P->outdegree;
+    const int ind = P->indegree;
 
-    int *sendcounts = NULL;
-    int *sdispls = NULL;
-    int *recvcounts = NULL;
-    int *rdispls = NULL;
+    /* Always provide non-NULL pointers (some MPI impls still check) */
+    int dummy_i = 0;
+    uint64_t dummy_u64 = 0;
+
+    int *sendcounts = NULL, *sdispls = NULL;
+    int *recvcounts = NULL, *rdispls = NULL;
 
     if (outd > 0)
     {
-        sendcounts = ensure_aligned_int(sendcounts, sendcap_io, outd);
-        sdispls = ensure_aligned_int(sdispls, sendcap_io, outd);
+        sendcounts = (int *)malloc((size_t)outd * sizeof(int));
+        sdispls = (int *)malloc((size_t)outd * sizeof(int));
         if (!sendcounts || !sdispls)
             die_abort(comm, "exchangeplan_exchange_delta: OOM sendcounts/sdispls");
+        memset(sendcounts, 0, (size_t)outd * sizeof(int));
+        memset(sdispls, 0, (size_t)outd * sizeof(int));
     }
+    else
+    {
+        sendcounts = &dummy_i;
+        sdispls = &dummy_i;
+    }
+
     if (ind > 0)
     {
-        recvcounts = ensure_aligned_int(recvcounts, recvcap_io, ind);
-        rdispls = ensure_aligned_int(rdispls, recvcap_io, ind);
+        recvcounts = (int *)malloc((size_t)ind * sizeof(int));
+        rdispls = (int *)malloc((size_t)ind * sizeof(int));
         if (!recvcounts || !rdispls)
             die_abort(comm, "exchangeplan_exchange_delta: OOM recvcounts/rdispls");
+        memset(recvcounts, 0, (size_t)ind * sizeof(int));
+        memset(rdispls, 0, (size_t)ind * sizeof(int));
     }
+    else
+    {
+        recvcounts = &dummy_i;
+        rdispls = &dummy_i;
+    }
+
+    /* Ensure buffers are non-NULL */
+    if (*sendbuf_io == NULL)
+    {
+        *sendbuf_io = (uint64_t *)malloc(sizeof(uint64_t));
+        if (!*sendbuf_io)
+            die_abort(comm, "OOM: delta sendbuf init");
+        *sendcap_io = 1;
+    }
+    if (*recvbuf_io == NULL)
+    {
+        *recvbuf_io = (uint64_t *)malloc(sizeof(uint64_t));
+        if (!*recvbuf_io)
+            die_abort(comm, "OOM: delta recvbuf init");
+        *recvcap_io = 1;
+    }
+
     int total_send_pairs = 0;
 
-    /* 1) Build sendbuf sequentially in dest-neighbor order */
+    /* 1) Build send pairs in neighbor-dest order */
     if (outd > 0)
     {
-        /* ensure send buffer (grow if needed) */
-        /* worst-case pairs == total_send_to */
-        int worst = P->total_send_to;
+        const int worst = P->total_send_to; /* max pairs */
         if (*sendcap_io < worst)
         {
-            int newcap = worst;
-            uint64_t *nb = (uint64_t *)realloc(*sendbuf_io, (size_t)newcap * sizeof(uint64_t));
+            uint64_t *nb = (uint64_t *)realloc(*sendbuf_io, (size_t)worst * sizeof(uint64_t));
             if (!nb)
-                die_abort(comm, "OOM: delta sendbuf");
+                die_abort(comm, "OOM: delta sendbuf grow");
             *sendbuf_io = nb;
-            *sendcap_io = newcap;
+            *sendcap_io = worst;
         }
 
         uint64_t *sendbuf = *sendbuf_io;
@@ -389,7 +420,6 @@ void exchangeplan_exchange_delta(const ExchangePlan *P,
                     lbl = comp_label[rep];
                 }
 
-                /* only send if decreases */
                 if (lbl < prev_sent[idx])
                 {
                     prev_sent[idx] = lbl;
@@ -403,67 +433,74 @@ void exchangeplan_exchange_delta(const ExchangePlan *P,
         }
     }
 
-    /* 2) Exchange counts */
-    if (ind > 0)
-    {
-        MPI_Neighbor_alltoall(sendcounts, 1, MPI_INT,
-                              recvcounts, 1, MPI_INT,
-                              P->comm_graph);
-    }
+    /* 2) Exchange counts (COLLECTIVE on comm_graph: ALWAYS CALL) */
+    MPI_Neighbor_alltoall(sendcounts, 1, MPI_INT,
+                          recvcounts, 1, MPI_INT,
+                          P->comm_graph);
 
     /* 3) Build rdispls + total recv */
     int total_recv_pairs = 0;
-    for (int k = 0; k < ind; ++k)
+    if (ind > 0)
     {
-        rdispls[k] = total_recv_pairs;
-        total_recv_pairs += recvcounts[k];
-    }
-
-    /* ensure recv buffer */
-    if (total_recv_pairs > 0)
-    {
-        if (*recvcap_io < total_recv_pairs)
+        for (int k = 0; k < ind; ++k)
         {
-            int newcap = total_recv_pairs;
-            uint64_t *nb = (uint64_t *)realloc(*recvbuf_io, (size_t)newcap * sizeof(uint64_t));
-            if (!nb)
-                die_abort(comm, "OOM: delta recvbuf");
-            *recvbuf_io = nb;
-            *recvcap_io = newcap;
+            rdispls[k] = total_recv_pairs;
+            total_recv_pairs += recvcounts[k];
         }
     }
 
-    /* 4) Exchange pairs */
-    if (total_send_pairs > 0 || total_recv_pairs > 0)
+    /* Ensure recv buffer capacity */
+    if (total_recv_pairs > 0 && *recvcap_io < total_recv_pairs)
     {
-        MPI_Neighbor_alltoallv(*sendbuf_io, sendcounts, sdispls, MPI_UINT64_T,
-                               *recvbuf_io, recvcounts, rdispls, MPI_UINT64_T,
-                               P->comm_graph);
+        uint64_t *nb = (uint64_t *)realloc(*recvbuf_io, (size_t)total_recv_pairs * sizeof(uint64_t));
+        if (!nb)
+            die_abort(comm, "OOM: delta recvbuf grow");
+        *recvbuf_io = nb;
+        *recvcap_io = total_recv_pairs;
     }
+
+    /* 4) Exchange pairs (COLLECTIVE on comm_graph: ALWAYS CALL) */
+    void *sb = (total_send_pairs > 0) ? (void *)(*sendbuf_io) : (void *)&dummy_u64;
+    void *rb = (total_recv_pairs > 0) ? (void *)(*recvbuf_io) : (void *)&dummy_u64;
+
+    MPI_Neighbor_alltoallv(sb, sendcounts, sdispls, MPI_UINT64_T,
+                           rb, recvcounts, rdispls, MPI_UINT64_T,
+                           P->comm_graph);
 
     /* 5) Apply incoming updates */
     if (total_recv_pairs > 0)
     {
-        uint64_t *rb = *recvbuf_io;
+        uint64_t *rbuf = *recvbuf_io;
+
         for (int k = 0; k < ind; ++k)
         {
             int src = P->sources[k];
-            int base = P->need_from_displs[src]; /* start of this source block in need_from_flat */
+            int base = P->need_from_displs[src];
 
             int off = rdispls[k];
             int cnt = recvcounts[k];
 
             for (int i = 0; i < cnt; ++i)
             {
-                uint64_t pr = rb[off + i];
+                uint64_t pr = rbuf[off + i];
                 uint32_t pos = pair_pos(pr);
                 uint32_t lbl = pair_lbl(pr);
 
-                /* receiver’s need_from order matches sender’s send_to order */
                 int global_pos = base + (int)pos;
                 uint32_t gidx = P->need_from_gidx_flat[global_pos];
                 ghost_labels[gidx] = lbl;
             }
         }
+    }
+
+    if (outd > 0)
+    {
+        free(sendcounts);
+        free(sdispls);
+    }
+    if (ind > 0)
+    {
+        free(recvcounts);
+        free(rdispls);
     }
 }
