@@ -131,8 +131,6 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     if (n_global == 0) return;
 
-    double t0_total = MPI_Wtime();
-
     /* ---------------- Phase 1: induced local-only graph + pthread CC ---------------- */
 
     uint64_t *lrow = (uint64_t*)calloc((size_t)n_local + 1, sizeof(uint64_t));
@@ -184,7 +182,6 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     Glocal.col_idx = lcol;
 
     uint32_t *comp_of = NULL; /* local vertex -> local representative (min local id) */
-
     if (n_local > 0)
     {
         comp_of = (uint32_t*)malloc((size_t)n_local * sizeof(uint32_t));
@@ -197,9 +194,8 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
         compute_connected_components_pthreads(&Glocal, comp_of, num_threads, chunk_size);
         double t_cc1 = MPI_Wtime();
 
-        fprintf(stderr, "[rank %d] Local CC done: n_local=%u m_local_local=%llu threads=%d time=%.3fs\n",
+        printf("[rank %d] Local CC done: n_local=%u m_local_local=%llu threads=%d time=%.3fs\n",
                 comm_rank, n_local, (unsigned long long)m_local_local, num_threads, t_cc1 - t_cc0);
-        fflush(stderr);
     }
 
     free(lrow); free(lcol);
@@ -281,9 +277,8 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     }
 
     double t_b1 = MPI_Wtime();
-    fprintf(stderr, "[rank %d] boundary_edges=%llu build_boundary=%.3fs\n",
+    printf("[rank %d] boundary_edges=%llu build_boundary=%.3fs\n",
             comm_rank, (unsigned long long)boundary_edges.size, t_b1 - t_b0);
-    fflush(stderr);
 
     /* ---------------- Build ghost list + map in ONE LINEAR PASS ---------------- */
 
@@ -324,9 +319,8 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     double t_g1 = MPI_Wtime();
 
-    fprintf(stderr, "[rank %d] ghost_count=%u build_ghosts+map=%.3fs\n",
+    printf("[rank %d] ghost_count=%u build_ghosts+map=%.3fs\n",
             comm_rank, ghost_count, t_g1 - t_g0);
-    fflush(stderr);
 
     /* ---------------- Phase 2: SV-ish merge (hook + pointer-jumping) ---------------- */
 
@@ -341,15 +335,13 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     if (ghost_count > 0)
         exchangeplan_build(&plan, ghost_vertices, ghost_count, n_global, comm, owner_of_vertex);
 
-    fprintf(stderr, "[rank %d] plan built indegree=%d outdegree=%d send=%d recv=%d\n",
+    printf("[rank %d] plan built indegree=%d outdegree=%d send=%d recv=%d\n",
             comm_rank, plan.indegree, plan.outdegree, plan.total_send_to, plan.total_need_from);
-    fflush(stderr);
 
     if (comm_rank == 1)
     {
-        fprintf(stderr, "[rank 1] DEBUG: ghost_count=%u boundary_edges=%llu reps=%d\n",
+        printf("[rank 1] DEBUG: ghost_count=%u boundary_edges=%llu reps=%d\n",
                 ghost_count, (unsigned long long)boundary_edges.size, rep_list.size);
-        fflush(stderr);
     }
 
     /* Make iteration-1 exchange timing reflect comm, not "waiting for last rank" */
@@ -449,8 +441,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
         if (merge_rounds <= 3 || (merge_rounds % 10 == 0))
         {
-            fprintf(stderr,
-                    "[rank %d] iter=%d pack=%.3fs exch=%.3fs hook=%.3fs jump=%.3fs total=%.3fs changed=%d\n",
+            printf("[rank %d] iter=%d pack=%.3fs exch=%.3fs hook=%.3fs jump=%.3fs total=%.3fs changed=%d\n",
                     comm_rank, merge_rounds,
                     t_pack1 - t_pack0,
                     t_ex1   - t_ex0,
@@ -458,13 +449,11 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                     t_jump1 - t_jump0,
                     it1 - it0,
                     (int)local_changed);
-            fflush(stderr);
         }
     }
 
     if (comm_rank == 0)
-        fprintf(stderr, "CC merge(hook+jump) converged in %d rounds\n", merge_rounds);
-
+        printf("CC merge(hook+jump) converged in %d rounds\n", merge_rounds);
     /* ---------------- Final per-vertex labels + allgather ---------------- */
 
     uint32_t *local_out = NULL;
@@ -518,11 +507,6 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     free(is_rep);
     u32veci_free(&rep_list);
-
-    double t1_total = MPI_Wtime();
-    fprintf(stderr, "[rank %d] compute_connected_components_mpi_advanced total=%.3fs\n",
-            comm_rank, t1_total - t0_total);
-    fflush(stderr);
 }
 
 /* unchanged helper */
