@@ -1,17 +1,10 @@
 #define _POSIX_C_SOURCE 200112L
 
 #include "vec_helpers.h"
+#include "runtime_utils.h"
 
 #include <stdlib.h>
-#include <stdio.h>
 
-static void die_abort(MPI_Comm comm, const char *msg)
-{
-  fprintf(stderr, "%s\n", msg);
-  MPI_Abort(comm, EXIT_FAILURE);
-}
-
-/* ---------------- U32Vec ---------------- */
 
 void u32vec_init(U32Vec *v)
 {
@@ -34,7 +27,7 @@ void u32vec_reserve(U32Vec *v, uint64_t new_cap, MPI_Comm comm)
     return;
   uint32_t *p = (uint32_t *)realloc(v->data, (size_t)new_cap * sizeof(uint32_t));
   if (!p)
-    die_abort(comm, "OOM: u32vec_reserve");
+    mpi_die_abort(comm, "OOM: u32vec_reserve");
   v->data = p;
   v->cap = new_cap;
 }
@@ -46,7 +39,6 @@ void u32vec_push(U32Vec *v, uint32_t x, MPI_Comm comm)
   v->data[v->size++] = x;
 }
 
-/* ---------------- U32VecI ---------------- */
 
 void u32veci_init(U32VecI *v)
 {
@@ -69,7 +61,7 @@ void u32veci_reserve(U32VecI *v, int new_cap, MPI_Comm comm)
     return;
   uint32_t *p = (uint32_t *)realloc(v->data, (size_t)new_cap * sizeof(uint32_t));
   if (!p)
-    die_abort(comm, "OOM: u32veci_reserve");
+    mpi_die_abort(comm, "OOM: u32veci_reserve");
   v->data = p;
   v->cap = new_cap;
 }
@@ -81,7 +73,6 @@ void u32veci_push(U32VecI *v, uint32_t x, MPI_Comm comm)
   v->data[v->size++] = x;
 }
 
-/* ---------------- BEVec ---------------- */
 
 void bevec_init(BEVec *v)
 {
@@ -104,7 +95,7 @@ void bevec_reserve(BEVec *v, uint64_t new_cap, MPI_Comm comm)
     return;
   BoundaryEdge *p = (BoundaryEdge *)realloc(v->data, (size_t)new_cap * sizeof(BoundaryEdge));
   if (!p)
-    die_abort(comm, "OOM: bevec_reserve");
+    mpi_die_abort(comm, "OOM: bevec_reserve");
   v->data = p;
   v->cap = new_cap;
 }
@@ -116,7 +107,6 @@ void bevec_push(BEVec *v, BoundaryEdge e, MPI_Comm comm)
   v->data[v->size++] = e;
 }
 
-/* ---------------- BPVec ---------------- */
 
 void bpvec_init(BPVec *v)
 {
@@ -139,7 +129,7 @@ void bpvec_reserve(BPVec *v, uint64_t new_cap, MPI_Comm comm)
     return;
   BoundaryPair *p = (BoundaryPair *)realloc(v->data, (size_t)new_cap * sizeof(BoundaryPair));
   if (!p)
-    die_abort(comm, "OOM: bpvec_reserve");
+    mpi_die_abort(comm, "OOM: bpvec_reserve");
   v->data = p;
   v->cap = new_cap;
 }

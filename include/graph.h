@@ -7,10 +7,10 @@
 // Compressed Sparse Row (CSR) representation of a graph.
 typedef struct
 {
-  uint32_t n;        // number of vertices
-  uint64_t m;        // number of edges
-  uint64_t *row_ptr; // row pointers
-  uint32_t *col_idx; // column indices
+  uint32_t n;
+  uint64_t m;
+  uint64_t *row_ptr;
+  uint32_t *col_idx;
 } CSRGraph;
 
 // Load an undirected graph from Matrix Market file into CSR form.

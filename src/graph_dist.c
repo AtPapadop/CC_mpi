@@ -1,18 +1,5 @@
 #define _POSIX_C_SOURCE 200112L
 
-/*
- * Edge-balanced 1D partition for the .mat (rank-0 scatter) path ONLY.
- *
- * Why you saw wrong results before:
- *  - cc_mpi.c had an owner_of_vertex() that assumed vertex-balanced blocks.
- *    With edge-balanced bounds, exchangeplan_build() sent ghost requests to
- *    the wrong ranks, corrupting the merge.
- *
- * This file fixes that by (a) computing/broadcasting bounds for .mat
- * distribution, and (b) storing them in DistCSRGraph so cc_mpi can compute
- * correct owners.
- */
-
 #include "graph_dist.h"
 
 #include <mpi.h>
@@ -23,7 +10,6 @@
 #include <limits.h>
 
 #include "graph.h"
-/* mmio.h not needed here: this file is for .mat scatter only. */
 
 #ifndef MPI_UINT32_T
 #define MPI_UINT32_T MPI_UNSIGNED
@@ -34,8 +20,6 @@
 #endif
 
 
-
-/* ----------------- Vertex-balanced contiguous blocks (baseline) ----------------- */
 
 static void compute_vertex_range(uint32_t n, int comm_size, int rank,
                                  uint32_t *v_start, uint32_t *v_end)
@@ -68,52 +52,7 @@ static void compute_vertex_range(uint32_t n, int comm_size, int rank,
     }
 }
 
-/* ----------------- Edge-balanced contiguous bounds for .mat scatter ----------------- */
 
-/*
- * Compute edge-balanced vertex boundaries from a global CSR row_ptr.
- * bounds has length comm_size+1, bounds[0]=0, bounds[comm_size]=n.
- */
-static void compute_edge_balanced_bounds_from_rowptr(const uint64_t *row_ptr,
-                                                     uint32_t n,
-                                                     int comm_size,
-                                                     uint32_t *bounds)
-{
-    bounds[0] = 0;
-    bounds[comm_size] = n;
-
-    if (!row_ptr || comm_size <= 1)
-        return;
-
-    const uint64_t total = row_ptr[n];
-    const uint64_t target_per_rank = (comm_size > 0) ? (total / (uint64_t)comm_size) : 0;
-
-    /* Greedy prefix cut: pick the smallest v where prefix_edges >= r * target_per_rank. */
-    uint32_t v = 0;
-    for (int r = 1; r < comm_size; ++r)
-    {
-        uint64_t target = (uint64_t)r * target_per_rank;
-
-        /* Advance v until we hit the target. */
-        while (v < n && row_ptr[v] < target)
-            ++v;
-
-        /* Ensure monotonic and non-empty blocks. */
-        uint32_t min_v = bounds[r - 1] + 1u;
-        uint32_t max_v = n - (uint32_t)(comm_size - r);
-
-        if (v < min_v)
-            v = min_v;
-        if (v > max_v)
-            v = max_v;
-
-        bounds[r] = v;
-    }
-}
-
-/* Balance work ~ edges + vertex_weight * vertices.
- * bounds length = comm_size+1.
- */
 static void compute_weighted_bounds_from_rowptr(const uint64_t *row_ptr,
                                                 uint32_t n,
                                                 int comm_size,
@@ -132,7 +71,6 @@ static void compute_weighted_bounds_from_rowptr(const uint64_t *row_ptr,
 
     for (int r = 1; r < comm_size; ++r)
     {
-        /* target cumulative weight for ranks < r */
         uint64_t target = (total_w * (uint64_t)r) / (uint64_t)comm_size;
 
         while (v < n && cum_w < target)
@@ -142,7 +80,6 @@ static void compute_weighted_bounds_from_rowptr(const uint64_t *row_ptr,
             v++;
         }
 
-        /* Ensure at least 1 vertex per rank and leave enough for remaining ranks */
         uint32_t min_v = bounds[r - 1] + 1u;
         uint32_t max_v = n - (uint32_t)(comm_size - r);
         if (v < min_v) v = min_v;
@@ -155,7 +92,6 @@ static void compute_weighted_bounds_from_rowptr(const uint64_t *row_ptr,
 }
 
 
-/* Scatter column indices while respecting MPI count limits. (unchanged helper) */
 static void scatter_col_idx_large(const uint32_t *sendbuf,
                                   const uint64_t *sendcounts,
                                   const uint64_t *displs,
@@ -204,11 +140,6 @@ static void scatter_col_idx_large(const uint32_t *sendbuf,
     }
 }
 
-/*
- * This file only targets the .mat rank-0 scatter path.
- * (No .mtx/.txt reader here.)
- */
-
 static int load_dist_csr_from_file_rank0(const char *path,
                                          int symmetrize,
                                          int drop_self_loops,
@@ -244,13 +175,11 @@ static int load_dist_csr_from_file_rank0(const char *path,
     MPI_Bcast(&n_global, 1, MPI_UINT32_T, 0, comm);
     MPI_Bcast(&m_global, 1, MPI_UINT64_T, 0, comm);
 
-    /* ----- Partition bounds ----- */
     uint32_t v_start = 0, v_end = 0;
 
-    /* Store bounds in DistCSRGraph so cc_mpi can compute correct owners. */
     out->part_bounds = NULL;
     out->part_size = 0;
-    out->part_kind = 0; /* 0=vertex-balanced, 1=edge-balanced */
+    out->part_kind = 0;
 
     if (use_edge && size > 1)
     {
@@ -263,7 +192,7 @@ static int load_dist_csr_from_file_rank0(const char *path,
 
         if (rank == 0)
         {
-            const uint32_t vertex_weight = 1; /* tuneable */
+            const uint32_t vertex_weight = 1;
             compute_weighted_bounds_from_rowptr(full.row_ptr, n_global, size, vertex_weight, bounds);
         }
 
@@ -283,7 +212,6 @@ static int load_dist_csr_from_file_rank0(const char *path,
 
     uint32_t n_local = v_end - v_start;
 
-    /* Scatter row_ptr segments: each rank gets row_ptr[v_start..v_end] (n_local+1 entries). */
     int *sendcounts_rowptr = NULL;
     int *displs_rowptr = NULL;
 
@@ -339,14 +267,12 @@ static int load_dist_csr_from_file_rank0(const char *path,
         free(displs_rowptr);
     }
 
-    /* Convert local_row_ptr from global offsets to local offsets. */
     uint64_t base_edge = (n_local > 0) ? local_row_ptr[0] : 0;
     for (uint32_t i = 0; i <= n_local; ++i)
         local_row_ptr[i] -= base_edge;
 
     uint64_t m_local = (n_local > 0) ? local_row_ptr[n_local] : 0;
 
-    /* Scatter col_idx segments: edges belonging to rows [v_start, v_end). */
     uint64_t *sendcounts_colidx = NULL;
     uint64_t *displs_colidx = NULL;
 
@@ -416,7 +342,6 @@ static int load_dist_csr_from_file_rank0(const char *path,
     return 0;
 }
 
-/* Public API: keep your existing .mtx/.txt path, but .mat uses edge-balanced if enabled. */
 int load_dist_csr_from_file(const char *path,
                             int symmetrize,
                             int drop_self_loops,
@@ -425,13 +350,11 @@ int load_dist_csr_from_file(const char *path,
                             MPI_Comm comm)
 {
     const char *ext = strrchr(path, '.');
-    /* Only .mat is supported by this rank-0 scatter loader. */
     if (ext && strcasecmp(ext, ".mat") == 0)
     {
         return load_dist_csr_from_file_rank0(path, symmetrize, drop_self_loops, use_edge, out, comm);
     }
 
-    /* Unsupported format. */
     return -1;
 }
 

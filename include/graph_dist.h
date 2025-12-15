@@ -14,29 +14,28 @@
  */
 typedef struct
 {
-  uint32_t n_global; // total number of vertices in the global graph
-  uint64_t m_global; // total number of edges in the global graph
-  uint32_t n_local;  // number of vertices owned by this rank
-  uint64_t m_local;  // number of edges owned by this rank
-  uint32_t v_start;  // global vertex ID of the first vertex owned by this rank
-  uint32_t v_end;    // global vertex ID of the last vertex owned by this rank (exclusive)
-  uint64_t *row_ptr; // local row pointers (size n_local + 1)
-  uint32_t *col_idx; // column indices (global vertex IDs)
-  uint32_t *part_bounds; // partition boundaries (size comm_size + 1), optional
-  int part_size;        // number of partitions (comm_size)
-  int part_kind;       // partitioning kind: 0=vertex-balanced, 1=edge-balanced
+  uint32_t n_global;
+  uint64_t m_global;
+  uint32_t n_local;
+  uint64_t m_local;
+  uint32_t v_start;
+  uint32_t v_end;
+  uint64_t *row_ptr;
+  uint32_t *col_idx;
+  uint32_t *part_bounds;
+  int part_size;
+  int part_kind;
 } DistCSRGraph;
 
 /**
  * Load an undirected graph from file into a distributed CSR representation.
  *
- *  - For .mtx/.txt: all ranks open the file and each rank builds ONLY its own rows.
- *  - For .mat: rank 0 uses load_csr_from_file() and scatters CSR rows.
- *
+ *  - For .mtx/.txt: No longer supported
+ *  - For .mat: Loads only from rank 0 and distributes to all ranks.
  * symmetrize = 1 → ensure undirected by adding reverse edges.
- * drop_self_loops = 1 → skip (i,i).
- *
- * Returns 0 on success, same code on all ranks.
+ * drop_self_loops = 1 → skip edges (i,i).
+ * use_edge = 1 → use edge-balanced partitioning; 0 → vertex-balanced.
+ * Returns 0 on success.
  */
 int load_dist_csr_from_file(const char *path,
                             int symmetrize,
@@ -44,9 +43,6 @@ int load_dist_csr_from_file(const char *path,
                             int use_edge,
                             DistCSRGraph *out,
                             MPI_Comm comm);
-
-                     
-
 /**
  * Free memory allocated for a DistCSRGraph. (local arrays only)
  */

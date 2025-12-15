@@ -7,12 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
-#include <unistd.h>
 
 #include "graph_dist.h"
 #include "cc_mpi.h"
 #include "opt_parser.h"
 #include "results_writer.h"
+#include "runtime_utils.h"
 
 static void print_usage(const char *prog)
 {
@@ -26,16 +26,6 @@ static void print_usage(const char *prog)
             "  -t, --threads N             Pthreads per rank (default: all cores)\n"
             "  -h, --help                  Show help message\n",
             prog);
-}
-
-static int default_num_threads(void)
-{
-#ifdef _SC_NPROCESSORS_ONLN
-    long t = sysconf(_SC_NPROCESSORS_ONLN);
-    return (t > 0) ? (int)t : 1;
-#else
-    return 1;
-#endif
 }
 
 int main(int argc, char **argv)
@@ -52,7 +42,7 @@ int main(int argc, char **argv)
     int runs = 1;
     const char *output_dir = "results";
     const char *matrix_path = NULL;
-    int threads_opt = 0; /* 0 => default */
+    int threads_opt = 0;
 
     const struct option long_opts[] = {
         {"chunk-size", required_argument, NULL, 'c'},
@@ -111,11 +101,10 @@ int main(int argc, char **argv)
     }
     matrix_path = argv[optind];
 
-    int threads_default = default_num_threads();
+    int threads_default = runtime_default_threads();
     int threads_to_use = (threads_opt > 0) ? threads_opt : threads_default;
     if (threads_to_use < 1) threads_to_use = 1;
 
-    /* tell CC code what to use */
     cc_mpi_set_num_threads(threads_to_use);
 
     if (rank == 0)

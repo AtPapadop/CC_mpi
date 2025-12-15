@@ -4,7 +4,6 @@
 #include "graph.h"
 #include <stdint.h>
 
-// Default chunk size for parallel algorithms
 #define DEFAULT_CHUNK_SIZE 4096
 
 // Sequential connected components algorithm using label propagation

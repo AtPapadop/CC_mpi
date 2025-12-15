@@ -3,8 +3,10 @@
 
 #include <mpi.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
+
+#include "runtime_utils.h"
+#include "vec_helpers.h"
 
 #ifndef MPI_UINT32_T
 #define MPI_UINT32_T MPI_UNSIGNED
@@ -13,61 +15,6 @@
 #ifndef MPI_UINT64_T
 #define MPI_UINT64_T MPI_UNSIGNED_LONG_LONG
 #endif
-
-static void die_abort(MPI_Comm comm, const char *msg)
-{
-    fprintf(stderr, "%s\n", msg);
-    MPI_Abort(comm, EXIT_FAILURE);
-}
-
-/* small growable vector (uint32) */
-typedef struct
-{
-    uint32_t *data;
-    int size, cap;
-} U32Vec;
-static void vinit(U32Vec *v)
-{
-    v->data = NULL;
-    v->size = 0;
-    v->cap = 0;
-}
-static void vfree(U32Vec *v)
-{
-    free(v->data);
-    v->data = NULL;
-    v->size = 0;
-    v->cap = 0;
-}
-static void vpush(U32Vec *v, uint32_t x, MPI_Comm comm)
-{
-    if (v->size == v->cap)
-    {
-        int nc = v->cap ? 2 * v->cap : 1024;
-        uint32_t *p = (uint32_t *)realloc(v->data, (size_t)nc * sizeof(uint32_t));
-        if (!p)
-            die_abort(comm, "exchangeplan: OOM");
-        v->data = p;
-        v->cap = nc;
-    }
-    v->data[v->size++] = x;
-}
-
-static int *ensure_aligned_int(int *ptr, int *cap, int need)
-{
-    if (*cap >= need)
-        return ptr;
-
-    if (ptr)
-        free(ptr);
-
-    int *p = NULL;
-    if (posix_memalign((void **)&p, 64, (size_t)need * sizeof(int)) != 0)
-        return NULL;
-
-    *cap = need;
-    return p;
-}
 
 void exchangeplan_free(ExchangePlan *P)
 {
@@ -114,17 +61,14 @@ int exchangeplan_build(ExchangePlan *P,
     const int rank = P->comm_rank;
     const int size = P->comm_size;
 
-    /* Build need_from lists:
-       need_from[p] holds vertex ids
-       need_gidx[p] holds the corresponding local ghost index gi */
-    U32Vec *need_from = (U32Vec *)malloc((size_t)size * sizeof(U32Vec));
-    U32Vec *need_gidx = (U32Vec *)malloc((size_t)size * sizeof(U32Vec));
+    U32VecI *need_from = (U32VecI *)malloc((size_t)size * sizeof(U32VecI));
+    U32VecI *need_gidx = (U32VecI *)malloc((size_t)size * sizeof(U32VecI));
     if (!need_from || !need_gidx)
-        die_abort(comm, "exchangeplan: OOM need_from/need_gidx");
+        mpi_die_abort(comm, "exchangeplan: OOM need_from/need_gidx");
     for (int p = 0; p < size; ++p)
     {
-        vinit(&need_from[p]);
-        vinit(&need_gidx[p]);
+        u32veci_init(&need_from[p]);
+        u32veci_init(&need_gidx[p]);
     }
 
     for (uint32_t gi = 0; gi < ghost_count; ++gi)
@@ -133,8 +77,8 @@ int exchangeplan_build(ExchangePlan *P,
         int owner = owner_fn(v, n_global, size);
         if (owner != rank)
         {
-            vpush(&need_from[owner], v, comm);
-            vpush(&need_gidx[owner], gi, comm);
+                u32veci_push(&need_from[owner], v, comm);
+                u32veci_push(&need_gidx[owner], gi, comm);
         }
     }
 
@@ -143,7 +87,7 @@ int exchangeplan_build(ExchangePlan *P,
     P->need_from_displs = (int *)malloc((size_t)size * sizeof(int));
     P->send_to_displs = (int *)malloc((size_t)size * sizeof(int));
     if (!P->need_from_counts || !P->send_to_counts || !P->need_from_displs || !P->send_to_displs)
-        die_abort(comm, "exchangeplan: OOM counts/displs");
+        mpi_die_abort(comm, "exchangeplan: OOM counts/displs");
 
     for (int p = 0; p < size; ++p)
         P->need_from_counts[p] = need_from[p].size;
@@ -171,9 +115,8 @@ int exchangeplan_build(ExchangePlan *P,
         P->need_from_flat = (uint32_t *)malloc((size_t)total_need * sizeof(uint32_t));
         P->need_from_gidx_flat = (uint32_t *)malloc((size_t)total_need * sizeof(uint32_t));
         if (!P->need_from_flat || !P->need_from_gidx_flat)
-            die_abort(comm, "exchangeplan: OOM need_from_flat/gidx_flat");
+            mpi_die_abort(comm, "exchangeplan: OOM need_from_flat/gidx_flat");
 
-        /* Flatten in the same order for both arrays */
         for (int p = 0; p < size; ++p)
         {
             int cnt = need_from[p].size;
@@ -191,14 +134,13 @@ int exchangeplan_build(ExchangePlan *P,
     {
         P->send_to_flat = (uint32_t *)malloc((size_t)total_send * sizeof(uint32_t));
         if (!P->send_to_flat)
-            die_abort(comm, "exchangeplan: OOM send_to_flat");
+            mpi_die_abort(comm, "exchangeplan: OOM send_to_flat");
     }
 
     MPI_Alltoallv(P->need_from_flat, P->need_from_counts, P->need_from_displs, MPI_UINT32_T,
                   P->send_to_flat, P->send_to_counts, P->send_to_displs, MPI_UINT32_T,
                   comm);
 
-    /* active neighbor sets */
     P->indegree = 0;
     P->outdegree = 0;
     for (int p = 0; p < size; ++p)
@@ -212,7 +154,7 @@ int exchangeplan_build(ExchangePlan *P,
     P->sources = (P->indegree > 0) ? (int *)malloc((size_t)P->indegree * sizeof(int)) : NULL;
     P->dests = (P->outdegree > 0) ? (int *)malloc((size_t)P->outdegree * sizeof(int)) : NULL;
     if ((P->indegree > 0 && !P->sources) || (P->outdegree > 0 && !P->dests))
-        die_abort(comm, "exchangeplan: OOM sources/dests");
+        mpi_die_abort(comm, "exchangeplan: OOM sources/dests");
 
     int ii = 0, oo = 0;
     for (int p = 0; p < size; ++p)
@@ -226,7 +168,6 @@ int exchangeplan_build(ExchangePlan *P,
     P->comm_graph = MPI_COMM_NULL;
     if (P->indegree > 0 || P->outdegree > 0)
     {
-        /* Avoid MPI reading from NULL even if count=0 */
         int dummy = 0;
         const int *srcs = (P->indegree > 0) ? P->sources : &dummy;
         const int *dsts = (P->outdegree > 0) ? P->dests : &dummy;
@@ -237,7 +178,6 @@ int exchangeplan_build(ExchangePlan *P,
                                        MPI_INFO_NULL, 0, &P->comm_graph);
     }
 
-    /* neighbor layouts */
     P->sendcounts = (P->outdegree > 0) ? (int *)malloc((size_t)P->outdegree * sizeof(int)) : NULL;
     P->sdispls = (P->outdegree > 0) ? (int *)malloc((size_t)P->outdegree * sizeof(int)) : NULL;
     P->recvcounts = (P->indegree > 0) ? (int *)malloc((size_t)P->indegree * sizeof(int)) : NULL;
@@ -245,7 +185,7 @@ int exchangeplan_build(ExchangePlan *P,
 
     if ((P->outdegree > 0 && (!P->sendcounts || !P->sdispls)) ||
         (P->indegree > 0 && (!P->recvcounts || !P->rdispls)))
-        die_abort(comm, "exchangeplan: OOM neighbor layouts");
+        mpi_die_abort(comm, "exchangeplan: OOM neighbor layouts");
 
     for (int k = 0; k < P->outdegree; ++k)
     {
@@ -264,19 +204,19 @@ int exchangeplan_build(ExchangePlan *P,
     {
         P->send_labels_flat = (uint32_t *)malloc((size_t)P->total_send_to * sizeof(uint32_t));
         if (!P->send_labels_flat)
-            die_abort(comm, "exchangeplan: OOM send_labels_flat");
+            mpi_die_abort(comm, "exchangeplan: OOM send_labels_flat");
     }
     if (P->total_need_from > 0)
     {
         P->recv_labels_flat = (uint32_t *)malloc((size_t)P->total_need_from * sizeof(uint32_t));
         if (!P->recv_labels_flat)
-            die_abort(comm, "exchangeplan: OOM recv_labels_flat");
+            mpi_die_abort(comm, "exchangeplan: OOM recv_labels_flat");
     }
 
     for (int p = 0; p < size; ++p)
     {
-        vfree(&need_from[p]);
-        vfree(&need_gidx[p]);
+        u32veci_free(&need_from[p]);
+        u32veci_free(&need_gidx[p]);
     }
     free(need_from);
     free(need_gidx);
@@ -294,30 +234,17 @@ static inline uint32_t pair_lbl(uint64_t x) { return (uint32_t)(x & 0xFFFFFFFFu)
 void exchangeplan_exchange(ExchangePlan *P, uint32_t *ghost_labels, MPI_Comm comm)
 {
     (void)comm;
-    if (!P)
-        return;
-
-    if (P->comm_graph != MPI_COMM_NULL &&
-        (P->total_send_to > 0 || P->total_need_from > 0))
-    {
-        MPI_Neighbor_alltoallv(P->send_labels_flat, P->sendcounts, P->sdispls, MPI_UINT32_T,
-                               P->recv_labels_flat, P->recvcounts, P->rdispls, MPI_UINT32_T,
-                               P->comm_graph);
-    }
-
-    for (int i = 0; i < P->total_need_from; ++i)
-    {
-        uint32_t gidx = P->need_from_gidx_flat[i]; /* NOW VALID */
-        ghost_labels[gidx] = P->recv_labels_flat[i];
-    }
+    MPI_Request req;
+    exchangeplan_exchange_start(P, &req);
+    exchangeplan_exchange_finish(P, ghost_labels, &req);
 }
 
 void exchangeplan_exchange_delta(const ExchangePlan *P,
                                  const uint32_t *comp_label,
                                  const uint32_t *comp_of,
                                  uint32_t v_start, uint32_t v_end,
-                                 uint32_t *prev_sent,    /* length P->total_send_to */
-                                 uint32_t *ghost_labels, /* length ghost_count */
+                                 uint32_t *prev_sent,
+                                 uint32_t *ghost_labels,
                                  MPI_Comm comm,
                                  uint64_t **sendbuf_io, int *sendcap_io,
                                  uint64_t **recvbuf_io, int *recvcap_io)
@@ -328,7 +255,6 @@ void exchangeplan_exchange_delta(const ExchangePlan *P,
     const int outd = P->outdegree;
     const int ind = P->indegree;
 
-    /* Always provide non-NULL pointers (some MPI impls still check) */
     int dummy_i = 0;
     uint64_t dummy_u64 = 0;
 
@@ -340,7 +266,7 @@ void exchangeplan_exchange_delta(const ExchangePlan *P,
         sendcounts = (int *)malloc((size_t)outd * sizeof(int));
         sdispls = (int *)malloc((size_t)outd * sizeof(int));
         if (!sendcounts || !sdispls)
-            die_abort(comm, "exchangeplan_exchange_delta: OOM sendcounts/sdispls");
+            mpi_die_abort(comm, "exchangeplan_exchange_delta: OOM sendcounts/sdispls");
         memset(sendcounts, 0, (size_t)outd * sizeof(int));
         memset(sdispls, 0, (size_t)outd * sizeof(int));
     }
@@ -355,7 +281,7 @@ void exchangeplan_exchange_delta(const ExchangePlan *P,
         recvcounts = (int *)malloc((size_t)ind * sizeof(int));
         rdispls = (int *)malloc((size_t)ind * sizeof(int));
         if (!recvcounts || !rdispls)
-            die_abort(comm, "exchangeplan_exchange_delta: OOM recvcounts/rdispls");
+            mpi_die_abort(comm, "exchangeplan_exchange_delta: OOM recvcounts/rdispls");
         memset(recvcounts, 0, (size_t)ind * sizeof(int));
         memset(rdispls, 0, (size_t)ind * sizeof(int));
     }
@@ -365,33 +291,31 @@ void exchangeplan_exchange_delta(const ExchangePlan *P,
         rdispls = &dummy_i;
     }
 
-    /* Ensure buffers are non-NULL */
     if (*sendbuf_io == NULL)
     {
         *sendbuf_io = (uint64_t *)malloc(sizeof(uint64_t));
         if (!*sendbuf_io)
-            die_abort(comm, "OOM: delta sendbuf init");
+            mpi_die_abort(comm, "OOM: delta sendbuf init");
         *sendcap_io = 1;
     }
     if (*recvbuf_io == NULL)
     {
         *recvbuf_io = (uint64_t *)malloc(sizeof(uint64_t));
         if (!*recvbuf_io)
-            die_abort(comm, "OOM: delta recvbuf init");
+            mpi_die_abort(comm, "OOM: delta recvbuf init");
         *recvcap_io = 1;
     }
 
     int total_send_pairs = 0;
 
-    /* 1) Build send pairs in neighbor-dest order */
     if (outd > 0)
     {
-        const int worst = P->total_send_to; /* max pairs */
+        const int worst = P->total_send_to;
         if (*sendcap_io < worst)
         {
             uint64_t *nb = (uint64_t *)realloc(*sendbuf_io, (size_t)worst * sizeof(uint64_t));
             if (!nb)
-                die_abort(comm, "OOM: delta sendbuf grow");
+                mpi_die_abort(comm, "OOM: delta sendbuf grow");
             *sendbuf_io = nb;
             *sendcap_io = worst;
         }
@@ -433,12 +357,10 @@ void exchangeplan_exchange_delta(const ExchangePlan *P,
         }
     }
 
-    /* 2) Exchange counts (COLLECTIVE on comm_graph: ALWAYS CALL) */
     MPI_Neighbor_alltoall(sendcounts, 1, MPI_INT,
                           recvcounts, 1, MPI_INT,
                           P->comm_graph);
 
-    /* 3) Build rdispls + total recv */
     int total_recv_pairs = 0;
     if (ind > 0)
     {
@@ -449,17 +371,15 @@ void exchangeplan_exchange_delta(const ExchangePlan *P,
         }
     }
 
-    /* Ensure recv buffer capacity */
     if (total_recv_pairs > 0 && *recvcap_io < total_recv_pairs)
     {
         uint64_t *nb = (uint64_t *)realloc(*recvbuf_io, (size_t)total_recv_pairs * sizeof(uint64_t));
         if (!nb)
-            die_abort(comm, "OOM: delta recvbuf grow");
+            mpi_die_abort(comm, "OOM: delta recvbuf grow");
         *recvbuf_io = nb;
         *recvcap_io = total_recv_pairs;
     }
 
-    /* 4) Exchange pairs (COLLECTIVE on comm_graph: ALWAYS CALL) */
     void *sb = (total_send_pairs > 0) ? (void *)(*sendbuf_io) : (void *)&dummy_u64;
     void *rb = (total_recv_pairs > 0) ? (void *)(*recvbuf_io) : (void *)&dummy_u64;
 
@@ -467,7 +387,6 @@ void exchangeplan_exchange_delta(const ExchangePlan *P,
                            rb, recvcounts, rdispls, MPI_UINT64_T,
                            P->comm_graph);
 
-    /* 5) Apply incoming updates */
     if (total_recv_pairs > 0)
     {
         uint64_t *rbuf = *recvbuf_io;
@@ -502,5 +421,33 @@ void exchangeplan_exchange_delta(const ExchangePlan *P,
     {
         free(recvcounts);
         free(rdispls);
+    }
+}
+
+void exchangeplan_exchange_start(ExchangePlan *P, MPI_Request *req)
+{
+    if (!P || !req) return;
+    *req = MPI_REQUEST_NULL;
+
+    if (P->comm_graph != MPI_COMM_NULL &&
+        (P->total_send_to > 0 || P->total_need_from > 0))
+    {
+        MPI_Ineighbor_alltoallv(P->send_labels_flat, P->sendcounts, P->sdispls, MPI_UINT32_T,
+                                P->recv_labels_flat, P->recvcounts, P->rdispls, MPI_UINT32_T,
+                                P->comm_graph, req);
+    }
+}
+
+void exchangeplan_exchange_finish(ExchangePlan *P, uint32_t *ghost_labels, MPI_Request *req)
+{
+    if (!P || !ghost_labels || !req) return;
+
+    if (*req != MPI_REQUEST_NULL)
+        MPI_Wait(req, MPI_STATUS_IGNORE);
+
+    for (int i = 0; i < P->total_need_from; ++i)
+    {
+        uint32_t gidx = P->need_from_gidx_flat[i];
+        ghost_labels[gidx] = P->recv_labels_flat[i];
     }
 }

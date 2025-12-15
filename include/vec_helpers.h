@@ -9,7 +9,7 @@ extern "C"
 {
 #endif
 
-  /* ---------- uint32_t vector with uint64 size (good for large collections) ---------- */
+  /** Growable uint32_t vector tracked with 64-bit size. */
   typedef struct
   {
     uint32_t *data;
@@ -22,7 +22,7 @@ extern "C"
   void u32vec_reserve(U32Vec *v, uint64_t new_cap, MPI_Comm comm);
   void u32vec_push(U32Vec *v, uint32_t x, MPI_Comm comm);
 
-  /* ---------- uint32_t vector with int size (good for MPI counts/displs) ---------- */
+  /** Growable uint32_t vector tracked with int size. */
   typedef struct
   {
     uint32_t *data;
@@ -35,11 +35,11 @@ extern "C"
   void u32veci_reserve(U32VecI *v, int new_cap, MPI_Comm comm);
   void u32veci_push(U32VecI *v, uint32_t x, MPI_Comm comm);
 
-  /* ---------- boundary edge/pair + their vectors (used by cc_mpi.c) ---------- */
+  /** Local representative and remote vertex describing a boundary edge. */
   typedef struct
   {
-    uint32_t rep;    /* local component representative (LOCAL id) */
-    uint32_t remote; /* remote vertex (GLOBAL id) */
+    uint32_t rep;
+    uint32_t remote;
   } BoundaryEdge;
 
   typedef struct
@@ -54,10 +54,11 @@ extern "C"
   void bevec_reserve(BEVec *v, uint64_t new_cap, MPI_Comm comm);
   void bevec_push(BEVec *v, BoundaryEdge e, MPI_Comm comm);
 
+  /** Local representative and ghost index pair. */
   typedef struct
   {
-    uint32_t rep;  /* local component representative (LOCAL id) */
-    uint32_t gidx; /* ghost index */
+    uint32_t rep;
+    uint32_t gidx;
   } BoundaryPair;
 
   typedef struct

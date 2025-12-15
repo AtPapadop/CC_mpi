@@ -10,13 +10,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <inttypes.h>
 
 #include "graph.h"
 #include "cc.h"
 #include "exchange_plan.h"
 #include "vec_helpers.h"
+#include "runtime_utils.h"
+#include "boundary_sort.h"
 
 #ifndef MPI_UINT32_T
 #define MPI_UINT32_T MPI_UNSIGNED
@@ -26,10 +27,6 @@
 #define MPI_UINT64_T MPI_UNSIGNED_LONG_LONG
 #endif
 
-/* ============================================================
-   Utilities / config
-   ============================================================ */
-
 static int g_cc_mpi_threads = 0;
 
 void cc_mpi_set_num_threads(int nthreads)
@@ -37,33 +34,14 @@ void cc_mpi_set_num_threads(int nthreads)
     g_cc_mpi_threads = (nthreads > 0) ? nthreads : 0;
 }
 
-static void die_abort(MPI_Comm comm, const char *msg)
-{
-    fprintf(stderr, "%s\n", msg);
-    MPI_Abort(comm, EXIT_FAILURE);
-}
-
-static int default_num_threads(void)
-{
-#ifdef _SC_NPROCESSORS_ONLN
-    long t = sysconf(_SC_NPROCESSORS_ONLN);
-    return (t > 0) ? (int)t : 1;
-#else
-    return 1;
-#endif
-}
-
-/* Must match DistCSRGraph partitioning (contiguous blocks) */
 static const uint32_t *g_part_bounds = NULL;
 static int g_part_size = 0;
-static int g_part_kind = 0; /* 0=vertex-balanced, 1=edge-balanced */
+static int g_part_kind = 0;
 
 static int owner_of_vertex(uint32_t v, uint32_t n_global, int comm_size)
 {
-    /* If graph_dist provided edge-balanced bounds, use them. */
     if (g_part_kind != 0 && g_part_bounds && g_part_size == comm_size && comm_size > 1)
     {
-        /* bounds length is comm_size+1, monotone increasing. */
         int lo = 0;
         int hi = comm_size - 1;
         while (lo <= hi)
@@ -78,7 +56,6 @@ static int owner_of_vertex(uint32_t v, uint32_t n_global, int comm_size)
             else
                 return mid;
         }
-        /* Fallback (should not happen if bounds cover [0,n_global]) */
         return (v >= g_part_bounds[comm_size]) ? (comm_size - 1) : 0;
     }
 
@@ -92,108 +69,8 @@ static int owner_of_vertex(uint32_t v, uint32_t n_global, int comm_size)
     if ((uint64_t)v < split)
         return (int)(v / (base + 1u));
 
-    if (base == 0) return (int)rem; /* degenerate */
+    if (base == 0) return (int)rem;
     return (int)(rem + (uint32_t)(((uint64_t)v - split) / base));
-}
-
-/* ============================================================
-   Fast in-place sort: American-flag radix sort on key(remote,rep)
-   key = (remote<<32) | rep
-   ============================================================ */
-
-static inline uint64_t be_key(const BoundaryEdge *e)
-{
-    return (((uint64_t)e->remote) << 32) | (uint64_t)e->rep;
-}
-
-static inline unsigned be_digit(const BoundaryEdge *e, int shift)
-{
-    return (unsigned)((be_key(e) >> shift) & 0xFFu);
-}
-
-static void be_insertion_sort(BoundaryEdge *a, uint64_t n)
-{
-    for (uint64_t i = 1; i < n; ++i)
-    {
-        BoundaryEdge x = a[i];
-        uint64_t kx = be_key(&x);
-        uint64_t j = i;
-        while (j > 0)
-        {
-            uint64_t kj = be_key(&a[j - 1]);
-            if (kj <= kx) break;
-            a[j] = a[j - 1];
-            --j;
-        }
-        a[j] = x;
-    }
-}
-
-/* In-place American-flag sort by bytes, MSD first.
-   Uses O(256) extra memory; no full-size temp buffer. */
-static void be_afsort_rec(BoundaryEdge *a, uint64_t n, int shift)
-{
-    if (n <= 64 || shift < 0)
-    {
-        be_insertion_sort(a, n);
-        return;
-    }
-
-    uint32_t count[256];
-    uint32_t start[256];
-    uint32_t next[256];
-
-    memset(count, 0, sizeof(count));
-
-    for (uint64_t i = 0; i < n; ++i)
-        count[be_digit(&a[i], shift)]++;
-
-    uint32_t sum = 0;
-    for (int b = 0; b < 256; ++b)
-    {
-        start[b] = sum;
-        sum += count[b];
-        next[b] = start[b];
-    }
-
-    /* in-place permutation into buckets */
-    for (int b = 0; b < 256; ++b)
-    {
-        uint32_t end = start[b] + count[b];
-        while (next[b] < end)
-        {
-            uint32_t i = next[b];
-            unsigned d = be_digit(&a[i], shift);
-            if ((int)d == b)
-            {
-                next[b]++;
-            }
-            else
-            {
-                uint32_t j = next[d]++;
-                BoundaryEdge tmp = a[i];
-                a[i] = a[j];
-                a[j] = tmp;
-            }
-        }
-    }
-
-    /* recurse buckets */
-    if (shift == 0) return;
-    int nshift = shift - 8;
-
-    for (int b = 0; b < 256; ++b)
-    {
-        uint32_t c = count[b];
-        if (c <= 1) continue;
-        be_afsort_rec(a + start[b], (uint64_t)c, nshift);
-    }
-}
-
-static void be_afsort(BoundaryEdge *a, uint64_t n)
-{
-    /* key is 64-bit; sort from top byte (shift=56) */
-    be_afsort_rec(a, n, 56);
 }
 
 /* ============================================================
@@ -216,7 +93,6 @@ static inline uint32_t get_vertex_label_global(uint32_t x,
         return comp_label[rep];
     }
 
-    /* lower_bound on sorted ghost_vertices */
     uint32_t lo = 0, hi = ghost_count;
     while (lo < hi)
     {
@@ -256,7 +132,6 @@ typedef struct
     uint32_t *comp_label;
     uint32_t *comp_min;
 
-    /* for pointer-jump */
     const uint32_t *comp_of;
     uint32_t v_start, v_end;
 
@@ -265,7 +140,7 @@ typedef struct
     const uint32_t *ghost_labels;
 
     volatile int *phase;
-    volatile int *changed;
+    int *changed;
     pthread_barrier_t *bar;
 } MergeWorker;
 
@@ -325,7 +200,10 @@ static void *merge_worker_main(void *arg)
                 }
             }
 
-            if (local_any) *W->changed = 1;
+            if (local_any)
+            {
+                __atomic_store_n(W->changed, 1, __ATOMIC_RELAXED);
+            }
         }
 
         pthread_barrier_wait(W->bar);
@@ -334,10 +212,6 @@ static void *merge_worker_main(void *arg)
     pthread_barrier_wait(W->bar);
     return NULL;
 }
-
-/* ============================================================
-   Main algorithm
-   ============================================================ */
 
 void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                                                uint32_t *restrict labels_global,
@@ -352,7 +226,6 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
 
-    /* Partition-aware owner mapping (needed when using edge-balanced bounds). */
     g_part_kind = Gd->part_kind;
     g_part_size = Gd->part_size;
     g_part_bounds = Gd->part_bounds;
@@ -369,11 +242,8 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     double t_total0 = MPI_Wtime();
 
-    /* ============================================================
-       Pass 1: count local-only edges for induced graph AND count boundary edges
-       ============================================================ */
     uint64_t *lrow = (uint64_t*)calloc((size_t)n_local + 1, sizeof(uint64_t));
-    if (!lrow) die_abort(comm, "OOM: lrow");
+    if (!lrow) mpi_die_abort(comm, "OOM: lrow");
 
     uint64_t boundary_raw = 0;
 
@@ -394,12 +264,11 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     uint64_t m_local_local = lrow[n_local];
 
-    /* build local-only col array */
     uint32_t *lcol = NULL;
     if (m_local_local > 0)
     {
         lcol = (uint32_t*)malloc((size_t)m_local_local * sizeof(uint32_t));
-        if (!lcol) die_abort(comm, "OOM: lcol");
+        if (!lcol) mpi_die_abort(comm, "OOM: lcol");
     }
 
     for (uint32_t li = 0; li < n_local; ++li)
@@ -423,13 +292,10 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     Glocal.row_ptr = lrow;
     Glocal.col_idx = lcol;
 
-    /* ============================================================
-       Phase 1: local CC (pthreads)
-       ============================================================ */
     uint32_t *comp_of = (uint32_t*)malloc((size_t)n_local * sizeof(uint32_t));
-    if (!comp_of) die_abort(comm, "OOM: comp_of");
+    if (!comp_of) mpi_die_abort(comm, "OOM: comp_of");
 
-    int nthreads = (g_cc_mpi_threads > 0) ? g_cc_mpi_threads : default_num_threads();
+    int nthreads = (g_cc_mpi_threads > 0) ? g_cc_mpi_threads : runtime_default_threads();
     if (nthreads < 1) nthreads = 1;
 
     double t_cc0 = MPI_Wtime();
@@ -444,13 +310,10 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     Glocal.row_ptr = NULL;
     Glocal.col_idx = NULL;
 
-    /* ============================================================
-       Build rep_list without pushes/reallocs
-       ============================================================ */
     double t_rep0 = MPI_Wtime();
 
     uint8_t *is_rep = (uint8_t*)calloc((size_t)n_local, 1);
-    if (!is_rep) die_abort(comm, "OOM: is_rep");
+    if (!is_rep) mpi_die_abort(comm, "OOM: is_rep");
 
     uint32_t rep_count = 0;
     for (uint32_t li = 0; li < n_local; ++li)
@@ -464,7 +327,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     }
 
     uint32_t *rep_list = (uint32_t*)malloc((size_t)rep_count * sizeof(uint32_t));
-    if (!rep_list) die_abort(comm, "OOM: rep_list");
+    if (!rep_list) mpi_die_abort(comm, "OOM: rep_list");
 
     uint32_t wrep = 0;
     for (uint32_t r = 0; r < n_local; ++r)
@@ -473,17 +336,13 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     double t_rep1 = MPI_Wtime();
     if (rank == 0) printf("[rank 0] reps=%u build_reps=%.3fs\n", rep_count, t_rep1 - t_rep0);
 
-    /* labels for reps (stored at rep index) */
     uint32_t *comp_label = (uint32_t*)malloc((size_t)n_local * sizeof(uint32_t));
     uint32_t *comp_min   = (uint32_t*)malloc((size_t)n_local * sizeof(uint32_t));
-    if (!comp_label || !comp_min) die_abort(comm, "OOM: comp_label/comp_min");
+    if (!comp_label || !comp_min) mpi_die_abort(comm, "OOM: comp_label/comp_min");
 
     for (uint32_t i = 0; i < n_local; ++i)
         comp_label[i] = v_start + i;
 
-    /* ============================================================
-       Build boundary edges into a single preallocated array (no vector growth)
-       ============================================================ */
     double t_b0 = MPI_Wtime();
 
     uint64_t boundary_sz = boundary_raw;
@@ -492,7 +351,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     if (boundary_sz > 0)
     {
         boundary = (BoundaryEdge*)malloc((size_t)boundary_sz * sizeof(BoundaryEdge));
-        if (!boundary) die_abort(comm, "OOM: boundary edges");
+        if (!boundary) mpi_die_abort(comm, "OOM: boundary edges");
     }
 
     uint64_t wb = 0;
@@ -515,29 +374,20 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
     double t_b_build = MPI_Wtime();
 
-    /* sort by (remote,rep) using fast in-place radix sort */
     if (boundary_sz > 1)
-        be_afsort(boundary, boundary_sz);
+        boundary_edges_sort(boundary, boundary_sz);
 
     double t_b_sort = MPI_Wtime();
 
-    /* dedup identical (remote,rep) */
     if (boundary_sz > 1)
     {
-        uint64_t w = 0;
-        for (uint64_t i = 0; i < boundary_sz; ++i)
+        uint64_t dedup_sz = boundary_edges_dedup(boundary, boundary_sz);
+        if (dedup_sz < boundary_sz)
         {
-            if (i == 0 ||
-                boundary[i].remote != boundary[w - 1].remote ||
-                boundary[i].rep    != boundary[w - 1].rep)
-            {
-                boundary[w++] = boundary[i];
-            }
+            BoundaryEdge *shr = (BoundaryEdge*)realloc(boundary, (size_t)dedup_sz * sizeof(BoundaryEdge));
+            if (shr) boundary = shr;
+            boundary_sz = dedup_sz;
         }
-        boundary_sz = w;
-
-        BoundaryEdge *shr = (BoundaryEdge*)realloc(boundary, (size_t)boundary_sz * sizeof(BoundaryEdge));
-        if (shr) boundary = shr;
     }
 
     double t_b1 = MPI_Wtime();
@@ -550,10 +400,6 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
            t_b_sort  - t_b_build,
            t_b1      - t_b_sort);
 
-    /* ============================================================
-       Build ghost list (unique remote vertices) in one linear pass
-       boundary is sorted by remote then rep.
-       ============================================================ */
     double t_g0 = MPI_Wtime();
 
     uint32_t ghost_count = 0;
@@ -563,7 +409,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     if (boundary_sz > 0)
     {
         ghost_vertices = (uint32_t*)malloc((size_t)boundary_sz * sizeof(uint32_t));
-        if (!ghost_vertices) die_abort(comm, "OOM: ghost_vertices");
+        if (!ghost_vertices) mpi_die_abort(comm, "OOM: ghost_vertices");
 
         uint32_t prev = UINT32_MAX;
         for (uint64_t i = 0; i < boundary_sz; ++i)
@@ -574,14 +420,14 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                 ghost_vertices[ghost_count++] = rv;
                 prev = rv;
             }
-            boundary[i].remote = ghost_count - 1; /* overwrite with ghost index */
+            boundary[i].remote = ghost_count - 1;
         }
 
         uint32_t *shr = (uint32_t*)realloc(ghost_vertices, (size_t)ghost_count * sizeof(uint32_t));
         if (shr) ghost_vertices = shr;
 
         ghost_labels = (uint32_t*)malloc((size_t)ghost_count * sizeof(uint32_t));
-        if (!ghost_labels) die_abort(comm, "OOM: ghost_labels");
+        if (!ghost_labels) mpi_die_abort(comm, "OOM: ghost_labels");
         for (uint32_t i = 0; i < ghost_count; ++i)
             ghost_labels[i] = ghost_vertices[i];
     }
@@ -589,9 +435,6 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     double t_g1 = MPI_Wtime();
     printf("[rank %d] ghost_count=%u build_ghosts=%.3fs\n", rank, ghost_count, t_g1 - t_g0);
 
-    /* ============================================================
-       Exchange plan
-       ============================================================ */
     double t_p0 = MPI_Wtime();
 
     ExchangePlan plan;
@@ -603,28 +446,43 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     printf("[rank %d] plan indegree=%d outdegree=%d send=%d recv=%d build_plan=%.3fs\n",
            rank, plan.indegree, plan.outdegree, plan.total_send_to, plan.total_need_from, t_p1 - t_p0);
 
+    uint32_t *prev_sent = NULL;
+    uint64_t *delta_sendbuf = NULL;
+    uint64_t *delta_recvbuf = NULL;
+    int delta_sendcap = 0;
+    int delta_recvcap = 0;
+
+    if (plan.total_send_to > 0)
+    {
+        prev_sent = (uint32_t*)malloc((size_t)plan.total_send_to * sizeof(uint32_t));
+        if (!prev_sent) mpi_die_abort(comm, "OOM: prev_sent");
+        for (int i = 0; i < plan.total_send_to; ++i)
+            prev_sent[i] = UINT32_MAX;
+    }
+
     /* ============================================================
        Merge loop: exchange + hook + pointer-jump
        Persistent thread pool
        ============================================================ */
-    int global_changed = (ghost_count > 0 && boundary_sz > 0 && rep_count > 0) ? 1 : 0;
 
     pthread_t *threads = NULL;
     MergeWorker *workers = NULL;
     pthread_barrier_t bar;
     volatile int phase = PH_IDLE;
-    volatile int changed = 0;
+
+    int changed = 0;
+    int pending_since_exchange = 0;
 
     if (nthreads < 1) nthreads = 1;
 
     if (nthreads > 1)
     {
         if (pthread_barrier_init(&bar, NULL, (unsigned)nthreads + 1u) != 0)
-            die_abort(comm, "pthread_barrier_init failed");
+            mpi_die_abort(comm, "pthread_barrier_init failed");
 
         threads = (pthread_t*)malloc((size_t)nthreads * sizeof(pthread_t));
         workers = (MergeWorker*)malloc((size_t)nthreads * sizeof(MergeWorker));
-        if (!threads || !workers) die_abort(comm, "OOM: thread pool");
+        if (!threads || !workers) mpi_die_abort(comm, "OOM: thread pool");
 
         for (int t = 0; t < nthreads; ++t)
         {
@@ -646,60 +504,48 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                 .bar = &bar
             };
             if (pthread_create(&threads[t], NULL, merge_worker_main, &workers[t]) != 0)
-                die_abort(comm, "pthread_create failed");
+                mpi_die_abort(comm, "pthread_create failed");
         }
     }
 
     MPI_Barrier(comm);
 
     int iter = 0;
-    int steps_since_exchange = exchange_interval; /* exchange first iter */
+    int steps_since_exchange = exchange_interval;
 
-    while (global_changed)
+    int global_pending = (ghost_count > 0 && boundary_sz > 0 && rep_count > 0) ? 1 : 0;
+    pending_since_exchange = global_pending ? 1 : 0;
+
+    while (global_pending)
     {
         double it0 = MPI_Wtime();
-
-        /* exchange interval */
-        double t_pack0 = MPI_Wtime();
-        double t_ex0 = t_pack0;
+        int did_exchange = 0;
 
         if (steps_since_exchange >= exchange_interval)
         {
-            /* pack outgoing labels */
-            for (int i = 0; i < plan.total_send_to; ++i)
+            if (plan.comm_graph != MPI_COMM_NULL)
             {
-                uint32_t v = plan.send_to_flat[i];
-                uint32_t lbl = v;
-
-                if (v >= v_start && v < v_end)
-                {
-                    uint32_t li  = v - v_start;
-                    uint32_t rep = comp_of[li];
-                    lbl = comp_label[rep];
-                }
-                plan.send_labels_flat[i] = lbl;
+                exchangeplan_exchange_delta(&plan,
+                                            comp_label,
+                                            comp_of,
+                                            v_start,
+                                            v_end,
+                                            prev_sent,
+                                            ghost_labels,
+                                            comm,
+                                            &delta_sendbuf,
+                                            &delta_sendcap,
+                                            &delta_recvbuf,
+                                            &delta_recvcap);
+                did_exchange = 1;
+                pending_since_exchange = 0;
             }
-            double t_pack1 = MPI_Wtime();
-
-            exchangeplan_exchange(&plan, ghost_labels, comm);
-            double t_ex1 = MPI_Wtime();
-
-            t_pack0 = t_pack0;
-            t_ex0   = t_pack1; /* for printing; we’ll store actual below */
-            (void)t_ex0;
 
             steps_since_exchange = 0;
-
-            /* we’ll keep real times in locals for printing */
-            double pack_dt = t_pack1 - it0;
-            double exch_dt = t_ex1 - t_pack1;
-            (void)pack_dt;
-            (void)exch_dt;
         }
 
         double t_pack1 = MPI_Wtime();
 
-        /* PH_INIT in pool (or serial) */
         double t_init0 = MPI_Wtime();
         if (nthreads > 1)
         {
@@ -717,7 +563,6 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
         }
         double t_init1 = MPI_Wtime();
 
-        /* SERIAL hook */
         double t_hook0 = MPI_Wtime();
         for (uint64_t e = 0; e < boundary_sz; ++e)
         {
@@ -728,9 +573,9 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
         }
         double t_hook1 = MPI_Wtime();
 
-        /* PH_UPD in pool (or serial) */
         double t_upd0 = MPI_Wtime();
-        changed = 0;
+
+        __atomic_store_n(&changed, 0, __ATOMIC_RELAXED);
 
         if (nthreads > 1)
         {
@@ -770,39 +615,55 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                     local_any = 1;
                 }
             }
-            if (local_any) changed = 1;
+            if (local_any)
+                __atomic_store_n(&changed, 1, __ATOMIC_RELAXED);
         }
+
+        int changed_snapshot = __atomic_load_n(&changed, __ATOMIC_RELAXED);
+
+        if (changed_snapshot) pending_since_exchange = 1;
+
         double t_upd1 = MPI_Wtime();
 
-        /* global changed */
         double t_allr0 = MPI_Wtime();
-        MPI_Allreduce((void*)&changed, &global_changed, 1, MPI_INT, MPI_LOR, comm);
+
+        int global_changed_any = 0;
+        MPI_Allreduce(&pending_since_exchange, &global_pending, 1, MPI_INT, MPI_LOR, comm);
+        MPI_Allreduce(&changed_snapshot, &global_changed_any, 1, MPI_INT, MPI_LOR, comm);
+
         double t_allr1 = MPI_Wtime();
 
         iter++;
-        steps_since_exchange++;
 
         double it1 = MPI_Wtime();
 
         if (iter <= 3 || (iter % 10 == 0))
         {
-            /* pack/exch timings: we only exchange on interval; report “pack/exch” as time since it0 to t_pack1 */
-            printf("[rank %d] iter=%d pack+exch=%.3fs init=%.3fs hook=%.3fs upd=%.3fs allr=%.3fs total=%.3fs changed=%d\n",
+            printf("[rank %d] iter=%d did_exch=%d pack+exch=%.3fs init=%.3fs hook=%.3fs upd=%.3fs allr=%.3fs total=%.3fs pending=%d changed=%d\n",
                    rank, iter,
+                   did_exchange,
                    (t_pack1 - it0),
                    (t_init1 - t_init0),
                    (t_hook1 - t_hook0),
                    (t_upd1  - t_upd0),
                    (t_allr1 - t_allr0),
                    (it1 - it0),
-                   global_changed);
+                   global_pending,
+                   changed_snapshot);
         }
+
+        if (!global_pending)
+            break;
+
+        if (global_pending && !global_changed_any && steps_since_exchange < exchange_interval)
+            steps_since_exchange = exchange_interval;
+
+        steps_since_exchange++;
     }
 
     if (rank == 0)
         printf("CC merge converged in %d rounds\n", iter);
 
-    /* stop pool */
     if (nthreads > 1)
     {
         phase = PH_STOP;
@@ -818,9 +679,6 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
         free(workers);
     }
 
-    /* ============================================================
-       Exact CC count (no gather): count roots (label == itself) exactly once
-       ============================================================ */
     uint64_t local_roots = 0;
     for (uint32_t li = 0; li < n_local; ++li)
     {
@@ -839,9 +697,9 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     if (rank == 0)
         printf("[rank 0] total_cc_time=%.3fs\n", t_total1 - t_total0);
 
-    /* ============================================================
-       Cleanup
-       ============================================================ */
+    free(prev_sent);
+    free(delta_sendbuf);
+    free(delta_recvbuf);
     exchangeplan_free(&plan);
 
     free(boundary);
@@ -856,7 +714,6 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     free(comp_min);
 }
 
-/* Keep this helper for the “gather labels” optional path in your benchmark */
 uint32_t count_connected_components(const uint32_t *restrict labels_global, uint32_t n_global)
 {
     if (n_global == 0 || labels_global == NULL) return 0;
