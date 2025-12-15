@@ -16,18 +16,14 @@ BIN_DIR = bin
 # Find all source files
 SRCS = $(wildcard $(SRC_DIR)/*.c)
 # Common objects (everything except files with main)
-COMMON_SRCS = $(filter-out $(SRC_DIR)/test_loaders.c $(SRC_DIR)/mpi_cc_benchmark.c, $(SRCS))
+COMMON_SRCS = $(filter-out $(SRC_DIR)/mpi_cc_benchmark.c, $(SRCS))
 COMMON_OBJS = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(COMMON_SRCS))
 
 # Executables
-TARGETS = test_loaders mpi_cc_benchmark
+TARGETS = mpi_cc_benchmark
 
 # Default target
 all: $(TARGETS)
-
-# Link test_loaders
-test_loaders: $(OBJ_DIR)/test_loaders.o $(COMMON_OBJS) | $(BIN_DIR)
-	$(CC) $(LDFLAGS) -o $(BIN_DIR)/$@ $^ $(LDLIBS)
 
 # Link mpi_cc_benchmark
 mpi_cc_benchmark: $(OBJ_DIR)/mpi_cc_benchmark.o $(COMMON_OBJS) | $(BIN_DIR)
