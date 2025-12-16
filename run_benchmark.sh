@@ -10,7 +10,7 @@
 
 module load gcc/13.2.0-iqpfkya  openmpi/5.0.3-rhzbeym matio
 
-export GRAPH_NAMES=("com-Friendster" "mycielskian20")
+export GRAPH_NAMES=("AGATHA_2015")
 
 # OpenMP setup
 export NUM_THREADS=$SLURM_CPUS_PER_TASK

@@ -38,16 +38,16 @@ static void be_afsort_rec(BoundaryEdge *a, uint64_t n, int shift)
         return;
     }
 
-    uint32_t count[256];
-    uint32_t start[256];
-    uint32_t next[256];
+    uint64_t count[256];
+    uint64_t start[256];
+    uint64_t next[256];
 
     memset(count, 0, sizeof(count));
 
     for (uint64_t i = 0; i < n; ++i)
         count[be_digit(&a[i], shift)]++;
 
-    uint32_t sum = 0;
+    uint64_t sum = 0;
     for (int b = 0; b < 256; ++b)
     {
         start[b] = sum;
@@ -57,10 +57,10 @@ static void be_afsort_rec(BoundaryEdge *a, uint64_t n, int shift)
 
     for (int b = 0; b < 256; ++b)
     {
-        uint32_t end = start[b] + count[b];
+        uint64_t end = start[b] + count[b];
         while (next[b] < end)
         {
-            uint32_t i = next[b];
+            uint64_t i = next[b];
             unsigned d = be_digit(&a[i], shift);
             if ((int)d == b)
             {
@@ -68,7 +68,7 @@ static void be_afsort_rec(BoundaryEdge *a, uint64_t n, int shift)
             }
             else
             {
-                uint32_t j = next[d]++;
+                uint64_t j = next[d]++;
                 BoundaryEdge tmp = a[i];
                 a[i] = a[j];
                 a[j] = tmp;
@@ -81,9 +81,9 @@ static void be_afsort_rec(BoundaryEdge *a, uint64_t n, int shift)
 
     for (int b = 0; b < 256; ++b)
     {
-        uint32_t c = count[b];
+        uint64_t c = count[b];
         if (c <= 1) continue;
-        be_afsort_rec(a + start[b], (uint64_t)c, nshift);
+        be_afsort_rec(a + start[b], c, nshift);
     }
 }
 
