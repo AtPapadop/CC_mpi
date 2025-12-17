@@ -32,8 +32,8 @@ typedef struct
  *
  *  - For .mtx/.txt: No longer supported
  *  - For .mat: Loads only from rank 0 and distributes to all ranks.
- * symmetrize = 1 → ensure undirected by adding reverse edges.
- * drop_self_loops = 1 → skip edges (i,i).
+ * symmetrize = legacy flag for compatibility; ignored.
+ * drop_self_loops = legacy flag for compatibility; ignored.
  * use_edge = 1 → use edge-balanced partitioning; 0 → vertex-balanced.
  * Returns 0 on success.
  */

@@ -13,7 +13,7 @@ mpirun -np <ranks> ./bin/mpi_cc_benchmark \
     -e <comma_separated_edge_scale_factors> \
     -t <omp_threads_per_rank> \
     -o <output_dir> \
-    <path_to_graph.(mtx|mat|txt)>
+    <path_to_graph.mat>
 ```
 Typical example on a shared cluster node:
 ```
