@@ -51,39 +51,48 @@ int main(int argc, char **argv)
         {"output", required_argument, NULL, 'o'},
         {"threads", required_argument, NULL, 't'},
         {"help", no_argument, NULL, 'h'},
-        {NULL, 0, NULL, 0}
-    };
+        {NULL, 0, NULL, 0}};
 
     int opt, idx;
     while ((opt = getopt_long(argc, argv, "c:e:r:o:t:h", long_opts, &idx)) != -1)
     {
         switch (opt)
         {
-        case 'c': chunk_spec = optarg; break;
-        case 'e': exchange_spec = optarg; break;
+        case 'c':
+            chunk_spec = optarg;
+            break;
+        case 'e':
+            exchange_spec = optarg;
+            break;
         case 'r':
             if (opt_parse_positive_int(optarg, &runs) != 0 || runs <= 0)
             {
-                if (rank == 0) fprintf(stderr, "Invalid runs: %s\n", optarg);
+                if (rank == 0)
+                    fprintf(stderr, "Invalid runs: %s\n", optarg);
                 MPI_Finalize();
                 return EXIT_FAILURE;
             }
             break;
-        case 'o': output_dir = optarg; break;
+        case 'o':
+            output_dir = optarg;
+            break;
         case 't':
             if (opt_parse_positive_int(optarg, &threads_opt) != 0 || threads_opt <= 0)
             {
-                if (rank == 0) fprintf(stderr, "Invalid threads: %s\n", optarg);
+                if (rank == 0)
+                    fprintf(stderr, "Invalid threads: %s\n", optarg);
                 MPI_Finalize();
                 return EXIT_FAILURE;
             }
             break;
         case 'h':
-            if (rank == 0) print_usage(argv[0]);
+            if (rank == 0)
+                print_usage(argv[0]);
             MPI_Finalize();
             return EXIT_SUCCESS;
         default:
-            if (rank == 0) print_usage(argv[0]);
+            if (rank == 0)
+                print_usage(argv[0]);
             MPI_Finalize();
             return EXIT_FAILURE;
         }
@@ -103,7 +112,8 @@ int main(int argc, char **argv)
 
     int threads_default = runtime_default_threads();
     int threads_to_use = (threads_opt > 0) ? threads_opt : threads_default;
-    if (threads_to_use < 1) threads_to_use = 1;
+    if (threads_to_use < 1)
+        threads_to_use = 1;
 
     cc_mpi_set_num_threads(threads_to_use);
 
@@ -123,7 +133,8 @@ int main(int argc, char **argv)
     opt_int_list_init(&chunk_sizes);
     if (opt_parse_range_list(chunk_spec, &chunk_sizes, "chunk sizes") != 0)
     {
-        if (rank == 0) fprintf(stderr, "Invalid chunk-size specification.\n");
+        if (rank == 0)
+            fprintf(stderr, "Invalid chunk-size specification.\n");
         MPI_Finalize();
         return EXIT_FAILURE;
     }
@@ -132,7 +143,8 @@ int main(int argc, char **argv)
     opt_int_list_init(&exchange_intervals);
     if (opt_parse_range_list(exchange_spec, &exchange_intervals, "exchange intervals") != 0)
     {
-        if (rank == 0) fprintf(stderr, "Invalid exchange interval specification.\n");
+        if (rank == 0)
+            fprintf(stderr, "Invalid exchange interval specification.\n");
         opt_int_list_free(&chunk_sizes);
         MPI_Finalize();
         return EXIT_FAILURE;
@@ -154,7 +166,8 @@ int main(int argc, char **argv)
     double *run_times = malloc((size_t)runs * sizeof(double));
     if (!run_times)
     {
-        if (rank == 0) fprintf(stderr, "Memory allocation failed (run_times).\n");
+        if (rank == 0)
+            fprintf(stderr, "Memory allocation failed (run_times).\n");
         MPI_Finalize();
         return EXIT_FAILURE;
     }
@@ -167,7 +180,8 @@ int main(int argc, char **argv)
 
     if (rc != 0)
     {
-        if (rank == 0) fprintf(stderr, "Error loading graph.\n");
+        if (rank == 0)
+            fprintf(stderr, "Error loading graph.\n");
         MPI_Abort(comm, EXIT_FAILURE);
     }
 
@@ -229,7 +243,8 @@ int main(int argc, char **argv)
     opt_int_list_free(&chunk_sizes);
     opt_int_list_free(&exchange_intervals);
 
-    if (rank == 0) printf("\nAll tests completed.\n");
+    if (rank == 0)
+        printf("\nAll tests completed.\n");
 
     MPI_Finalize();
     return EXIT_SUCCESS;

@@ -19,8 +19,6 @@
 #define MPI_UINT64_T MPI_UNSIGNED_LONG_LONG
 #endif
 
-
-
 static void compute_vertex_range(uint32_t n, int comm_size, int rank,
                                  uint32_t *v_start, uint32_t *v_end)
 {
@@ -52,14 +50,14 @@ static void compute_vertex_range(uint32_t n, int comm_size, int rank,
     }
 }
 
-
 static void compute_weighted_bounds_from_rowptr(const uint64_t *row_ptr,
                                                 uint32_t n,
                                                 int comm_size,
                                                 uint32_t vertex_weight,
                                                 uint32_t *bounds)
 {
-    if (comm_size <= 0) return;
+    if (comm_size <= 0)
+        return;
 
     const uint64_t total_edges = row_ptr ? row_ptr[n] : 0;
     const uint64_t total_w = total_edges + (uint64_t)vertex_weight * (uint64_t)n;
@@ -82,15 +80,16 @@ static void compute_weighted_bounds_from_rowptr(const uint64_t *row_ptr,
 
         uint32_t min_v = bounds[r - 1] + 1u;
         uint32_t max_v = n - (uint32_t)(comm_size - r);
-        if (v < min_v) v = min_v;
-        if (v > max_v) v = max_v;
+        if (v < min_v)
+            v = min_v;
+        if (v > max_v)
+            v = max_v;
 
         bounds[r] = v;
     }
 
     bounds[comm_size] = n;
 }
-
 
 static void scatter_col_idx_large(const uint32_t *sendbuf,
                                   const uint64_t *sendcounts,

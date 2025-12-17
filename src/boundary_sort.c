@@ -22,7 +22,8 @@ static void be_insertion_sort(BoundaryEdge *a, uint64_t n)
         while (j > 0)
         {
             uint64_t kj = be_key(&a[j - 1]);
-            if (kj <= kx) break;
+            if (kj <= kx)
+                break;
             a[j] = a[j - 1];
             --j;
         }
@@ -76,26 +77,30 @@ static void be_afsort_rec(BoundaryEdge *a, uint64_t n, int shift)
         }
     }
 
-    if (shift == 0) return;
+    if (shift == 0)
+        return;
     int nshift = shift - 8;
 
     for (int b = 0; b < 256; ++b)
     {
         uint64_t c = count[b];
-        if (c <= 1) continue;
+        if (c <= 1)
+            continue;
         be_afsort_rec(a + start[b], c, nshift);
     }
 }
 
 void boundary_edges_sort(BoundaryEdge *edges, uint64_t count)
 {
-    if (!edges || count <= 1) return;
+    if (!edges || count <= 1)
+        return;
     be_afsort_rec(edges, count, 56);
 }
 
 uint64_t boundary_edges_dedup(BoundaryEdge *edges, uint64_t count)
 {
-    if (!edges || count <= 1) return count;
+    if (!edges || count <= 1)
+        return count;
 
     uint64_t write = 1;
     BoundaryEdge prev = edges[0];

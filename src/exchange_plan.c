@@ -77,8 +77,8 @@ int exchangeplan_build(ExchangePlan *P,
         int owner = owner_fn(v, n_global, size);
         if (owner != rank)
         {
-                u32veci_push(&need_from[owner], v, comm);
-                u32veci_push(&need_gidx[owner], gi, comm);
+            u32veci_push(&need_from[owner], v, comm);
+            u32veci_push(&need_gidx[owner], gi, comm);
         }
     }
 
@@ -426,7 +426,8 @@ void exchangeplan_exchange_delta(const ExchangePlan *P,
 
 void exchangeplan_exchange_start(ExchangePlan *P, MPI_Request *req)
 {
-    if (!P || !req) return;
+    if (!P || !req)
+        return;
     *req = MPI_REQUEST_NULL;
 
     if (P->comm_graph != MPI_COMM_NULL &&
@@ -440,7 +441,8 @@ void exchangeplan_exchange_start(ExchangePlan *P, MPI_Request *req)
 
 void exchangeplan_exchange_finish(ExchangePlan *P, uint32_t *ghost_labels, MPI_Request *req)
 {
-    if (!P || !ghost_labels || !req) return;
+    if (!P || !ghost_labels || !req)
+        return;
 
     if (*req != MPI_REQUEST_NULL)
         MPI_Wait(req, MPI_STATUS_IGNORE);

@@ -57,6 +57,21 @@ int exchangeplan_build(ExchangePlan *P,
 
 /** Free all resources owned by the plan (safe to call on partially built plans). */
 void exchangeplan_free(ExchangePlan *P);
+
+/**
+ * Perform a delta exchange of updated labels for only those vertices whose
+ * labels have changed since the last exchange.
+ *
+ * - comp_label: array of size n_global with current component labels.
+ * - comp_of: array of size n_global with owner rank of each vertex.
+ * - v_start, v_end: local vertex range for this rank.
+ * - prev_sent: array of size P->total_send_to tracking previously sent labels;
+ *              updated in-place to current sent labels after exchange.
+ * - ghost_labels: array of size ghost_count with current ghost vertex labels;
+ *                 updated in-place with received labels after exchange.
+ * - sendbuf_io, recbuf_io: pointers to (uint64_t *) buffers and their capacities
+ *                          used for packing/unpacking; may be reallocated as needed.
+ */
 void exchangeplan_exchange_delta(const ExchangePlan *P,
                                  const uint32_t *comp_label,
                                  const uint32_t *comp_of,
@@ -66,20 +81,20 @@ void exchangeplan_exchange_delta(const ExchangePlan *P,
                                  MPI_Comm comm,
                                  uint64_t **sendbuf_io, int *sendcap_io,
                                  uint64_t **recvbuf_io, int *recvcap_io);
-/**
+/** LEGACY EXCHANGE INTERFACE - use exchange_delta instead
  * Start the non-blocking halo exchange using the plan:
  * - Caller must have filled P->send_labels, i.e. P->send_labels_flat[ ] for all send_to vertices.
  * - This function performs MPI_Ineighbor_alltoallv; caller must later call exchangeplan_exchange_finish().
  * - req is the MPI_Request handle for the non-blocking operation.
- */                            
+ */
 void exchangeplan_exchange_start(ExchangePlan *P, MPI_Request *req);
-/**
+/** LEGACY EXCHANGE INTERFACE - use exchange_delta instead
  * Finish the non-blocking halo exchange using the plan:
  * - ghost_labels must be indexed by ghost index corresponding to ghost_vertices used in build().
  * - req is the MPI_Request handle returned by exchangeplan_exchange_start().
  */
 void exchangeplan_exchange_finish(ExchangePlan *P, uint32_t *ghost_labels, MPI_Request *req);
-/**
+/** LEGACY EXCHANGE INTERFACE - use exchange_delta instead
  * This is simply a convenience wrapper around exchangeplan_exchange_start/finish that basicallly
  * ignores the non-blocking aspect.
  * Perform the halo exchange using the plan:
