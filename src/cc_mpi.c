@@ -75,11 +75,211 @@ static int owner_of_vertex(uint32_t v, uint32_t n_global, int comm_size)
     return (int)(rem + (uint32_t)(((uint64_t)v - split) / base));
 }
 
+/* --------------------------
+   Ghost map: uint32 -> uint32
+   (open addressing, linear probing)
+   Used to map global vertex id -> ghost index (gidx)
+   -------------------------- */
+
+typedef struct
+{
+    uint32_t *keys; /* global vertex ids */
+    uint32_t *vals; /* gidx */
+    uint32_t cap;   /* power-of-two */
+    uint32_t size;
+
+    int has_max;
+    uint32_t max_val;
+} GhostMap;
+
+static inline uint32_t hash_u32(uint32_t x)
+{
+    /* decent 32-bit mix */
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+static uint32_t next_pow2_u32_u64(uint64_t x)
+{
+    if (x <= 2)
+        return 2;
+    uint64_t p = 1;
+    while (p < x)
+        p <<= 1;
+    if (p > (uint64_t)UINT32_MAX)
+        return 0;
+    return (uint32_t)p;
+}
+
+static void ghostmap_free(GhostMap *M)
+{
+    if (!M)
+        return;
+    free(M->keys);
+    free(M->vals);
+    memset(M, 0, sizeof(*M));
+}
+
+static void ghostmap_init(GhostMap *M, uint32_t cap_pow2, MPI_Comm comm)
+{
+    memset(M, 0, sizeof(*M));
+    if (cap_pow2 < 1024)
+        cap_pow2 = 1024;
+    /* must be power of two */
+    if ((cap_pow2 & (cap_pow2 - 1u)) != 0)
+        mpi_die_abort(comm, "ghostmap_init: cap not power-of-two");
+
+    M->cap = cap_pow2;
+    M->keys = (uint32_t *)malloc((size_t)M->cap * sizeof(uint32_t));
+    M->vals = (uint32_t *)malloc((size_t)M->cap * sizeof(uint32_t));
+    if (!M->keys || !M->vals)
+        mpi_die_abort(comm, "ghostmap_init: OOM");
+
+    /* EMPTY = UINT32_MAX */
+    for (uint32_t i = 0; i < M->cap; ++i)
+        M->keys[i] = UINT32_MAX;
+}
+
+static void ghostmap_rehash(GhostMap *M, uint32_t newcap, MPI_Comm comm)
+{
+    GhostMap N;
+    ghostmap_init(&N, newcap, comm);
+
+    /* reinsert */
+    for (uint32_t i = 0; i < M->cap; ++i)
+    {
+        uint32_t k = M->keys[i];
+        if (k == UINT32_MAX)
+            continue;
+        uint32_t v = M->vals[i];
+
+        uint32_t mask = N.cap - 1u;
+        uint32_t idx = hash_u32(k) & mask;
+        while (N.keys[idx] != UINT32_MAX)
+            idx = (idx + 1u) & mask;
+        N.keys[idx] = k;
+        N.vals[idx] = v;
+        N.size++;
+    }
+
+    if (M->has_max)
+    {
+        N.has_max = 1;
+        N.max_val = M->max_val;
+    }
+
+    ghostmap_free(M);
+    *M = N;
+}
+
+static inline int ghostmap_get(const GhostMap *M, uint32_t key, uint32_t *out_val)
+{
+    if (key == UINT32_MAX)
+    {
+        if (M->has_max)
+        {
+            *out_val = M->max_val;
+            return 1;
+        }
+        return 0;
+    }
+
+    uint32_t mask = M->cap - 1u;
+    uint32_t idx = hash_u32(key) & mask;
+
+    while (1)
+    {
+        uint32_t k = M->keys[idx];
+        if (k == UINT32_MAX)
+            return 0;
+        if (k == key)
+        {
+            *out_val = M->vals[idx];
+            return 1;
+        }
+        idx = (idx + 1u) & mask;
+    }
+}
+
+static inline void ghostmap_put(GhostMap *M, uint32_t key, uint32_t val, MPI_Comm comm)
+{
+    if (key == UINT32_MAX)
+    {
+        M->has_max = 1;
+        M->max_val = val;
+        return;
+    }
+
+    /* grow at ~0.70 load */
+    if ((uint64_t)(M->size + 1u) * 10ull >= (uint64_t)M->cap * 7ull)
+    {
+        uint32_t newcap = (M->cap <= (UINT32_MAX / 2u)) ? (M->cap << 1u) : 0;
+        if (!newcap)
+            mpi_die_abort(comm, "ghostmap_put: cap overflow");
+        ghostmap_rehash(M, newcap, comm);
+    }
+
+    uint32_t mask = M->cap - 1u;
+    uint32_t idx = hash_u32(key) & mask;
+    while (M->keys[idx] != UINT32_MAX)
+        idx = (idx + 1u) & mask;
+
+    M->keys[idx] = key;
+    M->vals[idx] = val;
+    M->size++;
+}
+
+static inline void ensure_u32_array_cap(uint32_t **arr, uint32_t *cap_io, uint32_t need, MPI_Comm comm)
+{
+    uint32_t cap = *cap_io;
+    if (cap >= need)
+        return;
+
+    uint32_t newcap = cap ? cap : 1024u;
+    while (newcap < need)
+    {
+        if (newcap > (UINT32_MAX / 2u))
+            mpi_die_abort(comm, "ensure_u32_array_cap: cap overflow");
+        newcap <<= 1u;
+    }
+
+    uint32_t *nb = (uint32_t *)realloc(*arr, (size_t)newcap * sizeof(uint32_t));
+    if (!nb)
+        mpi_die_abort(comm, "ensure_u32_array_cap: OOM");
+    *arr = nb;
+    *cap_io = newcap;
+}
+
+static inline void ensure_boundary_cap(BoundaryEdge **arr, uint64_t *cap_io, uint64_t need, MPI_Comm comm)
+{
+    uint64_t cap = *cap_io;
+    if (cap >= need)
+        return;
+
+    uint64_t newcap = cap ? cap : 1024ull;
+    while (newcap < need)
+        newcap <<= 1ull;
+
+    if (newcap > (uint64_t)(SIZE_MAX / sizeof(BoundaryEdge)))
+        mpi_die_abort(comm, "ensure_boundary_cap: size overflow");
+
+    BoundaryEdge *nb = (BoundaryEdge *)realloc(*arr, (size_t)newcap * sizeof(BoundaryEdge));
+    if (!nb)
+        mpi_die_abort(comm, "ensure_boundary_cap: OOM");
+    *arr = nb;
+    *cap_io = newcap;
+}
+
+/* Return label(x) if known locally or as a ghost; otherwise missing=1. */
 static inline uint32_t get_vertex_label_global(uint32_t x,
                                                const uint32_t *comp_label,
                                                const uint32_t *comp_of,
                                                uint32_t v_start, uint32_t v_end,
-                                               const uint32_t *ghost_vertices, uint32_t ghost_count,
+                                               const GhostMap *gmap,
                                                const uint32_t *ghost_labels,
                                                int *missing)
 {
@@ -92,21 +292,12 @@ static inline uint32_t get_vertex_label_global(uint32_t x,
         return comp_label[rep];
     }
 
-    uint32_t lo = 0, hi = ghost_count;
-    while (lo < hi)
-    {
-        uint32_t mid = lo + (hi - lo) / 2;
-        uint32_t v = ghost_vertices[mid];
-        if (v < x)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    if (lo < ghost_count && ghost_vertices[lo] == x)
+    uint32_t gidx = 0;
+    if (gmap && ghost_labels && ghostmap_get(gmap, x, &gidx))
     {
         if (missing)
             *missing = 0;
-        return ghost_labels[lo];
+        return ghost_labels[gidx];
     }
 
     if (missing)
@@ -136,8 +327,7 @@ typedef struct
     const uint32_t *comp_of;
     uint32_t v_start, v_end;
 
-    const uint32_t *ghost_vertices;
-    uint32_t ghost_count;
+    const GhostMap *gmap;
     const uint32_t *ghost_labels;
 
     volatile int *phase;
@@ -181,14 +371,13 @@ static void *merge_worker_main(void *arg)
                 uint32_t x = W->comp_min[r];
                 for (int t = 0; t < MAX_JUMPS; ++t)
                 {
-                    int missing = 0;
+                    int miss = 0;
                     uint32_t y = get_vertex_label_global(x,
                                                          W->comp_label, W->comp_of,
                                                          W->v_start, W->v_end,
-                                                         W->ghost_vertices, W->ghost_count,
-                                                         W->ghost_labels,
-                                                         &missing);
-                    if (missing)
+                                                         W->gmap, W->ghost_labels,
+                                                         &miss);
+                    if (miss)
                         break;
                     if (y >= x)
                         break;
@@ -206,9 +395,7 @@ static void *merge_worker_main(void *arg)
             }
 
             if (local_any)
-            {
                 __atomic_store_n(W->changed, 1, __ATOMIC_RELAXED);
-            }
         }
 
         pthread_barrier_wait(W->bar);
@@ -361,19 +548,49 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     for (uint32_t i = 0; i < n_local; ++i)
         comp_label[i] = v_start + i;
 
+    /* -----------------------------------------------------------
+       Build contracted boundary edges WITHOUT boundary_raw array
+       - ghost map: global vertex -> gidx
+       - last_seen[gidx] stores (rep+1) last rep that inserted it,
+         so duplicates for the same rep are skipped.
+       ----------------------------------------------------------- */
     double t_b0 = MPI_Wtime();
 
-    uint64_t boundary_sz = boundary_raw;
     BoundaryEdge *boundary = NULL;
+    uint64_t boundary_sz = 0;
+    uint64_t boundary_cap = 0;
 
-    if (boundary_sz > 0)
+    /* heuristic initial capacity ~ boundary_raw/12 */
     {
-        boundary = (BoundaryEdge *)malloc((size_t)boundary_sz * sizeof(BoundaryEdge));
+        uint64_t est = boundary_raw / 12ull + 1024ull;
+        if (est < 1024ull)
+            est = 1024ull;
+        boundary_cap = est;
+        if (boundary_cap > (uint64_t)(SIZE_MAX / sizeof(BoundaryEdge)))
+            boundary_cap = (uint64_t)(SIZE_MAX / sizeof(BoundaryEdge));
+        boundary = (BoundaryEdge *)malloc((size_t)boundary_cap * sizeof(BoundaryEdge));
         if (!boundary)
-            mpi_die_abort(comm, "OOM: boundary edges");
+            mpi_die_abort(comm, "OOM: boundary (contracted)");
     }
 
-    uint64_t wb = 0;
+    uint32_t *ghost_vertices = NULL;
+    uint32_t *ghost_labels = NULL;
+    uint32_t *ghost_last_seen = NULL;
+    uint32_t ghost_cap = 0;
+    uint32_t ghost_count = 0;
+
+    GhostMap gmap;
+    {
+        /* heuristic initial map cap based on boundary_raw/16 */
+        uint64_t gest = boundary_raw / 16ull + 4096ull;
+        if (gest < 1024ull)
+            gest = 1024ull;
+        uint32_t cap = next_pow2_u32_u64(gest * 2ull);
+        if (!cap)
+            mpi_die_abort(comm, "ghost map cap too large");
+        ghostmap_init(&gmap, cap, comm);
+    }
+
     for (uint32_t li = 0; li < n_local; ++li)
     {
         uint32_t rep = comp_of[li];
@@ -388,77 +605,66 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                 continue;
             if (v >= n_global)
                 continue;
-            boundary[wb++] = (BoundaryEdge){rep, v};
-        }
-    }
-    boundary_sz = wb;
 
-    double t_b_build = MPI_Wtime();
+            uint32_t gidx = 0;
+            if (!ghostmap_get(&gmap, v, &gidx))
+            {
+                gidx = ghost_count;
 
-    if (boundary_sz > 1)
-        boundary_edges_sort(boundary, boundary_sz);
+                ensure_u32_array_cap(&ghost_vertices, &ghost_cap, ghost_count + 1u, comm);
+                ensure_u32_array_cap(&ghost_labels, &ghost_cap, ghost_count + 1u, comm);
+                ensure_u32_array_cap(&ghost_last_seen, &ghost_cap, ghost_count + 1u, comm);
 
-    double t_b_sort = MPI_Wtime();
+                ghost_vertices[ghost_count] = v;
+                ghost_labels[ghost_count] = v;
+                ghost_last_seen[ghost_count] = 0;
+                ghost_count++;
 
-    if (boundary_sz > 1)
-    {
-        uint64_t dedup_sz = boundary_edges_dedup(boundary, boundary_sz);
-        if (dedup_sz < boundary_sz)
-        {
-            BoundaryEdge *shr = (BoundaryEdge *)realloc(boundary, (size_t)dedup_sz * sizeof(BoundaryEdge));
-            if (shr)
-                boundary = shr;
-            boundary_sz = dedup_sz;
+                ghostmap_put(&gmap, v, gidx, comm);
+            }
+
+            /* dedup per rep */
+            uint32_t mark = rep + 1u; /* rep may be 0, so +1 avoids sentinel 0 */
+            if (ghost_last_seen[gidx] == mark)
+                continue;
+            ghost_last_seen[gidx] = mark;
+
+            /* append contracted boundary edge (rep, gidx) */
+            if (boundary_sz == boundary_cap)
+                ensure_boundary_cap(&boundary, &boundary_cap, boundary_sz + 1ull, comm);
+
+            boundary[boundary_sz++] = (BoundaryEdge){rep, gidx};
         }
     }
 
     double t_b1 = MPI_Wtime();
 
-    printf("[rank %d] boundary_edges raw=%llu dedup=%llu build=%.3fs sort=%.3fs dedup=%.3fs\n",
+    printf("[rank %d] boundary_contract raw=%llu contracted=%llu ghost_count=%u build=%.3fs\n",
            rank,
            (unsigned long long)boundary_raw,
            (unsigned long long)boundary_sz,
-           t_b_build - t_b0,
-           t_b_sort - t_b_build,
-           t_b1 - t_b_sort);
+           ghost_count,
+           t_b1 - t_b0);
 
-    double t_g0 = MPI_Wtime();
+    free(ghost_last_seen);
+    ghost_last_seen = NULL;
 
-    uint32_t ghost_count = 0;
-    uint32_t *ghost_vertices = NULL;
-    uint32_t *ghost_labels = NULL;
-
+    /* shrink boundary arrays (optional) */
     if (boundary_sz > 0)
     {
-        ghost_vertices = (uint32_t *)malloc((size_t)boundary_sz * sizeof(uint32_t));
-        if (!ghost_vertices)
-            mpi_die_abort(comm, "OOM: ghost_vertices");
-
-        uint32_t prev = UINT32_MAX;
-        for (uint64_t i = 0; i < boundary_sz; ++i)
-        {
-            uint32_t rv = boundary[i].remote;
-            if (rv != prev)
-            {
-                ghost_vertices[ghost_count++] = rv;
-                prev = rv;
-            }
-            boundary[i].remote = ghost_count - 1;
-        }
-
-        uint32_t *shr = (uint32_t *)realloc(ghost_vertices, (size_t)ghost_count * sizeof(uint32_t));
+        BoundaryEdge *shr = (BoundaryEdge *)realloc(boundary, (size_t)boundary_sz * sizeof(BoundaryEdge));
         if (shr)
-            ghost_vertices = shr;
-
-        ghost_labels = (uint32_t *)malloc((size_t)ghost_count * sizeof(uint32_t));
-        if (!ghost_labels)
-            mpi_die_abort(comm, "OOM: ghost_labels");
-        for (uint32_t i = 0; i < ghost_count; ++i)
-            ghost_labels[i] = ghost_vertices[i];
+            boundary = shr;
     }
-
-    double t_g1 = MPI_Wtime();
-    printf("[rank %d] ghost_count=%u build_ghosts=%.3fs\n", rank, ghost_count, t_g1 - t_g0);
+    if (ghost_count > 0)
+    {
+        uint32_t *shr1 = (uint32_t *)realloc(ghost_vertices, (size_t)ghost_count * sizeof(uint32_t));
+        if (shr1)
+            ghost_vertices = shr1;
+        uint32_t *shr2 = (uint32_t *)realloc(ghost_labels, (size_t)ghost_count * sizeof(uint32_t));
+        if (shr2)
+            ghost_labels = shr2;
+    }
 
     double t_p0 = MPI_Wtime();
 
@@ -519,8 +725,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                 .comp_of = comp_of,
                 .v_start = v_start,
                 .v_end = v_end,
-                .ghost_vertices = ghost_vertices,
-                .ghost_count = ghost_count,
+                .gmap = &gmap,
                 .ghost_labels = ghost_labels,
                 .phase = &phase,
                 .changed = &changed,
@@ -589,7 +794,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
         for (uint64_t e = 0; e < boundary_sz; ++e)
         {
             uint32_t rep = boundary[e].rep;
-            uint32_t gidx = boundary[e].remote;
+            uint32_t gidx = boundary[e].remote; /* remote holds gidx now */
             uint32_t lbl = ghost_labels[gidx];
             if (lbl < comp_min[rep])
                 comp_min[rep] = lbl;
@@ -618,14 +823,13 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
                 for (int t = 0; t < MAX_JUMPS; ++t)
                 {
-                    int missing = 0;
+                    int miss = 0;
                     uint32_t y = get_vertex_label_global(x,
                                                          comp_label, comp_of,
                                                          v_start, v_end,
-                                                         ghost_vertices, ghost_count,
-                                                         ghost_labels,
-                                                         &missing);
-                    if (missing)
+                                                         &gmap, ghost_labels,
+                                                         &miss);
+                    if (miss)
                         break;
                     if (y >= x)
                         break;
@@ -655,6 +859,8 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
         double t_allr0 = MPI_Wtime();
 
         int global_changed_any = 0;
+
+        /* you can combine these two Allreduces later if you want */
         MPI_Allreduce(&pending_since_exchange, &global_pending, 1, MPI_INT, MPI_LOR, comm);
         MPI_Allreduce(&changed_snapshot, &global_changed_any, 1, MPI_INT, MPI_LOR, comm);
 
@@ -732,6 +938,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     free(boundary);
     free(ghost_vertices);
     free(ghost_labels);
+    ghostmap_free(&gmap);
 
     free(rep_list);
     free(is_rep);
