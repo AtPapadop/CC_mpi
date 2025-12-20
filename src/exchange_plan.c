@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "runtime_utils.h"
+#include "vec_helpers.h"
 
 #ifndef MPI_UINT32_T
 #define MPI_UINT32_T MPI_UNSIGNED
@@ -60,24 +61,37 @@ int exchangeplan_build(ExchangePlan *P,
     const int rank = P->comm_rank;
     const int size = P->comm_size;
 
-    /* two-pass count/fill instead of per-push vectors */
-    P->need_from_counts = (int *)calloc((size_t)size, sizeof(int));
-    P->send_to_counts = (int *)calloc((size_t)size, sizeof(int));
-    P->need_from_displs = (int *)malloc((size_t)size * sizeof(int));
-    P->send_to_displs = (int *)malloc((size_t)size * sizeof(int));
-    if (!P->need_from_counts || !P->send_to_counts || !P->need_from_displs || !P->send_to_displs)
-        mpi_die_abort(comm, "exchangeplan: OOM counts/displs");
+    U32VecI *need_from = (U32VecI *)malloc((size_t)size * sizeof(U32VecI));
+    U32VecI *need_gidx = (U32VecI *)malloc((size_t)size * sizeof(U32VecI));
+    if (!need_from || !need_gidx)
+        mpi_die_abort(comm, "exchangeplan: OOM need_from/need_gidx");
+    for (int p = 0; p < size; ++p)
+    {
+        u32veci_init(&need_from[p]);
+        u32veci_init(&need_gidx[p]);
+    }
 
-    /* pass 1: count */
     for (uint32_t gi = 0; gi < ghost_count; ++gi)
     {
         uint32_t v = ghost_vertices[gi];
         int owner = owner_fn(v, n_global, size);
         if (owner != rank)
-            P->need_from_counts[owner]++;
+        {
+            u32veci_push(&need_from[owner], v, comm);
+            u32veci_push(&need_gidx[owner], gi, comm);
+        }
     }
 
-    /* determine how many each rank needs FROM us */
+    P->need_from_counts = (int *)malloc((size_t)size * sizeof(int));
+    P->send_to_counts = (int *)malloc((size_t)size * sizeof(int));
+    P->need_from_displs = (int *)malloc((size_t)size * sizeof(int));
+    P->send_to_displs = (int *)malloc((size_t)size * sizeof(int));
+    if (!P->need_from_counts || !P->send_to_counts || !P->need_from_displs || !P->send_to_displs)
+        mpi_die_abort(comm, "exchangeplan: OOM counts/displs");
+
+    for (int p = 0; p < size; ++p)
+        P->need_from_counts[p] = need_from[p].size;
+
     MPI_Alltoall(P->need_from_counts, 1, MPI_INT,
                  P->send_to_counts, 1, MPI_INT, comm);
 
@@ -102,6 +116,18 @@ int exchangeplan_build(ExchangePlan *P,
         P->need_from_gidx_flat = (uint32_t *)malloc((size_t)total_need * sizeof(uint32_t));
         if (!P->need_from_flat || !P->need_from_gidx_flat)
             mpi_die_abort(comm, "exchangeplan: OOM need_from_flat/gidx_flat");
+
+        for (int p = 0; p < size; ++p)
+        {
+            int cnt = need_from[p].size;
+            if (cnt > 0)
+            {
+                memcpy(P->need_from_flat + P->need_from_displs[p],
+                       need_from[p].data, (size_t)cnt * sizeof(uint32_t));
+                memcpy(P->need_from_gidx_flat + P->need_from_displs[p],
+                       need_gidx[p].data, (size_t)cnt * sizeof(uint32_t));
+            }
+        }
     }
 
     if (total_send > 0)
@@ -111,32 +137,6 @@ int exchangeplan_build(ExchangePlan *P,
             mpi_die_abort(comm, "exchangeplan: OOM send_to_flat");
     }
 
-    /* pass 2: fill need_from_flat + need_from_gidx_flat */
-    if (total_need > 0)
-    {
-        int *cursor = (int *)malloc((size_t)size * sizeof(int));
-        if (!cursor)
-            mpi_die_abort(comm, "exchangeplan: OOM cursor");
-
-        for (int p = 0; p < size; ++p)
-            cursor[p] = P->need_from_displs[p];
-
-        for (uint32_t gi = 0; gi < ghost_count; ++gi)
-        {
-            uint32_t v = ghost_vertices[gi];
-            int owner = owner_fn(v, n_global, size);
-            if (owner == rank)
-                continue;
-
-            int pos = cursor[owner]++;
-            P->need_from_flat[pos] = v;
-            P->need_from_gidx_flat[pos] = gi;
-        }
-
-        free(cursor);
-    }
-
-    /* now ask owners for those vertices; owners receive in send_to_flat */
     MPI_Alltoallv(P->need_from_flat, P->need_from_counts, P->need_from_displs, MPI_UINT32_T,
                   P->send_to_flat, P->send_to_counts, P->send_to_displs, MPI_UINT32_T,
                   comm);
@@ -213,6 +213,14 @@ int exchangeplan_build(ExchangePlan *P,
             mpi_die_abort(comm, "exchangeplan: OOM recv_labels_flat");
     }
 
+    for (int p = 0; p < size; ++p)
+    {
+        u32veci_free(&need_from[p]);
+        u32veci_free(&need_gidx[p]);
+    }
+    free(need_from);
+    free(need_gidx);
+
     return 0;
 }
 
@@ -231,7 +239,6 @@ void exchangeplan_exchange(ExchangePlan *P, uint32_t *ghost_labels, MPI_Comm com
     exchangeplan_exchange_finish(P, ghost_labels, &req);
 }
 
-/* unchanged delta exchange */
 void exchangeplan_exchange_delta(const ExchangePlan *P,
                                  const uint32_t *comp_label,
                                  const uint32_t *comp_of,
