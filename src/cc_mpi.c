@@ -533,7 +533,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     MPI_Barrier(comm);
 
     int iter = 0;
-    int steps_since_exchange = exchange_interval;
+    int steps_since_exchange = 0; /* local relax rounds since last exchange */
 
     int global_pending = (ghost_count > 0 && boundary_sz > 0 && rep_count > 0) ? 1 : 0;
     pending_since_exchange = global_pending ? 1 : 0;
@@ -542,31 +542,7 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
     {
         double it0 = MPI_Wtime();
         int did_exchange = 0;
-
-        if (steps_since_exchange >= exchange_interval)
-        {
-            if (plan.comm_graph != MPI_COMM_NULL)
-            {
-                exchangeplan_exchange_delta(&plan,
-                                            comp_label,
-                                            comp_of,
-                                            v_start,
-                                            v_end,
-                                            prev_sent,
-                                            ghost_labels,
-                                            comm,
-                                            &delta_sendbuf,
-                                            &delta_sendcap,
-                                            &delta_recvbuf,
-                                            &delta_recvcap);
-                did_exchange = 1;
-                pending_since_exchange = 0;
-            }
-
-            steps_since_exchange = 0;
-        }
-
-        double t_pack1 = MPI_Wtime();
+        double exch_time = 0.0;
 
         double t_init0 = MPI_Wtime();
         if (nthreads > 1)
@@ -662,14 +638,67 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
 
         iter++;
 
+        if (!global_pending)
+        {
+            double it1 = MPI_Wtime();
+            if (iter <= 3 || (iter % 10 == 0))
+            {
+                printf("[rank %d] iter=%d did_exch=%d exch=%.3fs init=%.3fs hook=%.3fs upd=%.3fs allr=%.3fs total=%.3fs pending=%d changed=%d\n",
+                       rank, iter,
+                       did_exchange,
+                       exch_time,
+                       (t_init1 - t_init0),
+                       (t_hook1 - t_hook0),
+                       (t_upd1 - t_upd0),
+                       (t_allr1 - t_allr0),
+                       (it1 - it0),
+                       global_pending,
+                       changed_snapshot);
+            }
+            break;
+        }
+
+        /* Count this local relax round and decide whether to exchange now.
+           Exchange either:
+             - after exchange_interval relax rounds, OR
+             - immediately when no local work is left anywhere (global_changed_any == 0). */
+        steps_since_exchange++;
+
+        if (plan.comm_graph != MPI_COMM_NULL)
+        {
+            int do_exchange = (steps_since_exchange >= exchange_interval) || (!global_changed_any);
+            if (do_exchange)
+            {
+                double ex0 = MPI_Wtime();
+                exchangeplan_exchange_delta(&plan,
+                                            comp_label,
+                                            comp_of,
+                                            v_start,
+                                            v_end,
+                                            prev_sent,
+                                            ghost_labels,
+                                            comm,
+                                            &delta_sendbuf,
+                                            &delta_sendcap,
+                                            &delta_recvbuf,
+                                            &delta_recvcap);
+                double ex1 = MPI_Wtime();
+                exch_time = ex1 - ex0;
+
+                did_exchange = 1;
+                pending_since_exchange = 0;
+                steps_since_exchange = 0;
+            }
+        }
+
         double it1 = MPI_Wtime();
 
         if (iter <= 3 || (iter % 10 == 0))
         {
-            printf("[rank %d] iter=%d did_exch=%d pack+exch=%.3fs init=%.3fs hook=%.3fs upd=%.3fs allr=%.3fs total=%.3fs pending=%d changed=%d\n",
+            printf("[rank %d] iter=%d did_exch=%d exch=%.3fs init=%.3fs hook=%.3fs upd=%.3fs allr=%.3fs total=%.3fs pending=%d changed=%d\n",
                    rank, iter,
                    did_exchange,
-                   (t_pack1 - it0),
+                   exch_time,
                    (t_init1 - t_init0),
                    (t_hook1 - t_hook0),
                    (t_upd1 - t_upd0),
@@ -678,14 +707,6 @@ void compute_connected_components_mpi_advanced(const DistCSRGraph *restrict Gd,
                    global_pending,
                    changed_snapshot);
         }
-
-        if (!global_pending)
-            break;
-
-        if (global_pending && !global_changed_any && steps_since_exchange < exchange_interval)
-            steps_since_exchange = exchange_interval;
-
-        steps_since_exchange++;
     }
 
     if (rank == 0)
